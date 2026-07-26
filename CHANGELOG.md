@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Grok hosted web_search / x_search results reach Claude Code.** Grok `web_search_call` and
+  `custom_tool_call` (`x_search` / `x_keyword_search` / …) items were dropped on the way back, so
+  Claude Code never saw `server_tool_use` / `web_search_tool_result` / `x_search_tool_result` or
+  `usage.server_tool_use`. The reducer now maps those calls (query + url citations / scraped
+  answer links) into Anthropic server-tool SSE ahead of the answer text, counts them in usage
+  (`web_search_requests` total; `x_search_requests` when applicable), and still only advertises
+  `x_search` when Claude offered XSearch.
+
 - **Tool-result images reach Codex/Kimi/Grok.** User-message images were already translated, but
   Anthropic `tool_result` content with base64 `image` blocks was dropped (`[image omitted]` on
   Codex/Grok, text-only flatten on Kimi). Base64 tool images now emit Responses

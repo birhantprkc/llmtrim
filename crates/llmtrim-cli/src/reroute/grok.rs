@@ -11,7 +11,10 @@
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::reroute::sse::{ReduceEvent, SseLineParser, StopReason, Usage};
+use crate::reroute::sse::{
+    ReduceEvent, SERVER_TOOL_ID_PREFIX, SseLineParser, StopReason, Usage, WEB_SEARCH_RESULT_TOOL,
+    X_SEARCH_RESULT_TOOL,
+};
 
 pub const HOST: &str = "cli-chat-proxy.grok.com";
 pub const PATH: &str = "/v1/responses";
@@ -78,9 +81,9 @@ pub fn build_request_body(
     body.insert("model".into(), json!(model));
 
     let mut instructions = crate::reroute::flatten_system_text(anthropic.get("system"));
-    // Only advertise hosted tools when Claude Code offered them. We do not yet reduce hosted
-    // search streams back into Anthropic server_tool blocks, so auto-injecting x_search every
-    // turn would steer the model into tools Claude Code never sees.
+    // Only advertise hosted tools when Claude Code offered them. Hosted search streams are
+    // reduced back into Anthropic server_tool blocks, but x_search is still opt-in (only when
+    // Claude offered XSearch) so we do not invent X tools the client never registered.
     let tools = build_tools(anthropic);
     if tools
         .iter()
@@ -509,12 +512,31 @@ struct ToolCall {
     stopped: bool,
 }
 
+/// Hosted search recorded from a Grok `web_search_call` or `custom_tool_call` (`x_search`),
+/// emitted as Anthropic `server_tool_use` + `*_tool_result` once citations/text are known.
+struct PendingHostedSearch {
+    id: String,
+    /// Anthropic server tool name: `web_search` or `x_search`.
+    name: String,
+    query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostedSearchResultItem {
+    title: String,
+    url: String,
+}
+
 /// Stateful reducer: Grok Responses SSE → shared [`ReduceEvent`] stream.
 ///
 /// Tool calls are keyed by `call_id` (with `item_id` → `call_id` fallback) so interleaved
 /// argument deltas on the wire buffer correctly. Anthropic SSE still requires non-interleaved
 /// blocks, so each tool is emitted as ToolStart/Delta/Stop only when that call completes or
 /// when a different block (text/thinking) must open.
+///
+/// Hosted `web_search` / `x_search` complete server-side on Grok; they are buffered and reduced
+/// into Anthropic `server_tool_use` + result blocks (same encoding path as Codex) before answer
+/// text, so Claude Code sees the search turn.
 ///
 /// Reasoning items with `encrypted_content` (when requested via `include`) are tunnelled out as
 /// Anthropic thinking `signature_delta` so the next turn can rebuild a Grok `reasoning` input
@@ -538,6 +560,18 @@ pub struct Reducer {
     /// Last encrypted blob emitted as a signature, so the repeated `added`/`done` copies of one
     /// reasoning item dedupe while a later item still gets its own signature.
     last_signature: Option<String>,
+    /// Hosted searches not yet emitted as Anthropic server-tool blocks. Answer text after a
+    /// search is deferred until these flush so the result block can include citations scraped
+    /// from the answer (and any `url_citation` annotations).
+    pending_hosted_searches: Vec<PendingHostedSearch>,
+    /// In-flight Grok `custom_tool_call` items (id → (name, input buffer)). Used for x_search.
+    hosted_custom_calls: std::collections::HashMap<String, (String, String)>,
+    /// Citations from `response.output_text.annotation.added` (`url_citation`).
+    search_citations: Vec<HostedSearchResultItem>,
+    /// Answer text held while a hosted search is pending (for citation scrape + order).
+    deferred_text_deltas: Vec<String>,
+    /// Accumulated assistant text this turn (for scraping URLs into search results).
+    current_assistant_text: String,
 }
 
 impl Reducer {
@@ -554,6 +588,11 @@ impl Reducer {
             terminal_seen: false,
             thinking_encrypted: None,
             last_signature: None,
+            pending_hosted_searches: Vec::new(),
+            hosted_custom_calls: std::collections::HashMap::new(),
+            search_citations: Vec::new(),
+            deferred_text_deltas: Vec::new(),
+            current_assistant_text: String::new(),
         }
     }
 
@@ -567,6 +606,8 @@ impl Reducer {
 
     pub fn finish(&mut self) -> Vec<ReduceEvent> {
         let mut out = Vec::new();
+        self.flush_hosted_searches(&mut out);
+        self.flush_deferred_text(&mut out);
         self.close_open(&mut out);
         self.emit_remaining_tools(&mut out);
         if !self.terminal_seen {
@@ -579,6 +620,130 @@ impl Reducer {
             });
         }
         out
+    }
+
+    fn has_unflushed_hosted_search(&self) -> bool {
+        !self.pending_hosted_searches.is_empty()
+    }
+
+    /// Emit buffered hosted searches as Anthropic server-tool blocks, using collected citations
+    /// and any markdown/bare URLs from the (possibly deferred) answer text.
+    fn flush_hosted_searches(&mut self, out: &mut Vec<ReduceEvent>) {
+        if self.pending_hosted_searches.is_empty() {
+            return;
+        }
+        // Close an open client function / text / thinking block before server-tool blocks.
+        if matches!(self.open, Open::Tool | Open::Thinking | Open::Text) {
+            self.close_open(out);
+        }
+        let mut text = self.current_assistant_text.clone();
+        for delta in &self.deferred_text_deltas {
+            text.push_str(delta);
+        }
+        let mut results = self.search_citations.clone();
+        for scraped in scrape_search_results_from_text(&text) {
+            if results.iter().any(|r| r.url == scraped.url) {
+                continue;
+            }
+            results.push(scraped);
+        }
+        let searches = std::mem::take(&mut self.pending_hosted_searches);
+        let result_content: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                })
+            })
+            .collect();
+        let result_json =
+            serde_json::to_string(&result_content).unwrap_or_else(|_| "[]".to_string());
+        for search in searches {
+            let input = json!({ "query": search.query });
+            let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+            let result_tool = if search.name == "x_search" {
+                X_SEARCH_RESULT_TOOL
+            } else {
+                WEB_SEARCH_RESULT_TOOL
+            };
+            // Encoder special-cases srvtoolu_* + name web_search/x_search → server_tool_use.
+            out.push(ReduceEvent::ToolStart {
+                id: search.id.clone(),
+                name: search.name,
+            });
+            out.push(ReduceEvent::ToolDelta(partial));
+            out.push(ReduceEvent::ToolStop);
+            out.push(ReduceEvent::ToolStart {
+                id: search.id,
+                name: result_tool.into(),
+            });
+            out.push(ReduceEvent::ToolDelta(result_json.clone()));
+            out.push(ReduceEvent::ToolStop);
+        }
+    }
+
+    /// Replay text that arrived while hosted search was still pending.
+    fn flush_deferred_text(&mut self, out: &mut Vec<ReduceEvent>) {
+        if self.deferred_text_deltas.is_empty() {
+            return;
+        }
+        self.flush_hosted_searches(out);
+        if self.open != Open::Text {
+            out.push(ReduceEvent::TextStart);
+            self.open = Open::Text;
+        }
+        for delta in std::mem::take(&mut self.deferred_text_deltas) {
+            self.current_assistant_text.push_str(&delta);
+            out.push(ReduceEvent::TextDelta(delta));
+        }
+    }
+
+    fn note_hosted_search(&mut self, raw_id: &str, name: &str, query: String) {
+        if raw_id.is_empty() {
+            return;
+        }
+        let id = server_tool_use_id_from_grok_id(raw_id);
+        if let Some(existing) = self.pending_hosted_searches.iter_mut().find(|s| s.id == id) {
+            if existing.query.is_empty() && !query.is_empty() {
+                existing.query = query;
+            }
+            if existing.name.is_empty() && !name.is_empty() {
+                existing.name = name.to_string();
+            }
+            return;
+        }
+        self.pending_hosted_searches.push(PendingHostedSearch {
+            id,
+            name: name.to_string(),
+            query,
+        });
+    }
+
+    fn note_url_citation(&mut self, v: &Value) {
+        let Some(annotation) = v.get("annotation") else {
+            return;
+        };
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            return;
+        }
+        let Some(url) = annotation.get("url").and_then(Value::as_str) else {
+            return;
+        };
+        if url.is_empty() || self.search_citations.iter().any(|r| r.url == url) {
+            return;
+        }
+        let title = annotation
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(url)
+            .to_string();
+        self.search_citations.push(HostedSearchResultItem {
+            title,
+            url: url.to_string(),
+        });
     }
 
     fn close_open(&mut self, out: &mut Vec<ReduceEvent>) {
@@ -752,6 +917,8 @@ impl Reducer {
         if self.open == Open::Text {
             return;
         }
+        // Hosted search blocks must precede the answer that cites them.
+        self.flush_hosted_searches(out);
         self.close_open(out);
         out.push(ReduceEvent::TextStart);
         self.open = Open::Text;
@@ -762,6 +929,8 @@ impl Reducer {
         if self.open == Open::Tool && self.open_tool.as_deref() == Some(call_id) {
             return;
         }
+        self.flush_hosted_searches(out);
+        self.flush_deferred_text(out);
         self.close_open(out);
         let Some(tool) = self.tools.get_mut(call_id) else {
             return;
@@ -787,7 +956,11 @@ impl Reducer {
                 let item = v.get("item").cloned().unwrap_or(Value::Null);
                 match item.get("type").and_then(Value::as_str) {
                     Some("message") => {
-                        self.open_text(out);
+                        if self.has_unflushed_hosted_search() {
+                            // Answer text is held until hosted search blocks flush.
+                        } else {
+                            self.open_text(out);
+                        }
                     }
                     Some("function_call") => {
                         let call_id = item
@@ -828,11 +1001,58 @@ impl Reducer {
                             self.note_reasoning_encrypted(out, enc.to_string(), false);
                         }
                     }
-                    // Hosted search / custom tools — no Claude function block (Grok runs them).
-                    // Must not close an open client function tool when these complete later.
-                    Some("custom_tool_call") | Some("web_search_call") => {}
+                    // Hosted search / custom tools — Grok runs them; reduce to server_tool blocks
+                    // on `done`. Must not close an open client function tool when these appear.
+                    Some("web_search_call") => {
+                        if let Some(query) = web_search_query(&item) {
+                            self.note_hosted_search(
+                                item.get("id").and_then(Value::as_str).unwrap_or(""),
+                                "web_search",
+                                query,
+                            );
+                        }
+                    }
+                    Some("custom_tool_call") => {
+                        let id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("");
+                        if id.is_empty() {
+                            return;
+                        }
+                        let raw_name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("x_search");
+                        // Grok may emit x_keyword_search / x_semantic_search; normalize to x_search.
+                        let name = if raw_name.starts_with("x_") {
+                            "x_search"
+                        } else {
+                            raw_name
+                        };
+                        self.hosted_custom_calls
+                            .insert(id.to_string(), (name.to_string(), String::new()));
+                    }
                     _ => {}
                 }
+            }
+            "response.custom_tool_call_input.delta" => {
+                let Some(id) = v.get("item_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
+                if let Some((_, input)) = self.hosted_custom_calls.get_mut(id) {
+                    input.push_str(delta);
+                }
+            }
+            "response.custom_tool_call_input.done"
+            | "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed" => {}
+            "response.output_text.annotation.added" => {
+                self.note_url_citation(v);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
@@ -847,7 +1067,14 @@ impl Reducer {
                 if delta.is_empty() {
                     return;
                 }
+                // Hold answer text until hosted searches flush so result blocks can include
+                // citations scraped from the answer (and any url_citation annotations).
+                if self.has_unflushed_hosted_search() {
+                    self.deferred_text_deltas.push(delta.to_string());
+                    return;
+                }
                 self.open_text(out);
+                self.current_assistant_text.push_str(delta);
                 out.push(ReduceEvent::TextDelta(delta.to_string()));
             }
             "response.function_call_arguments.delta" => {
@@ -929,8 +1156,48 @@ impl Reducer {
                             self.close_thinking(out);
                         }
                     }
-                    // Hosted done must not close an open function tool.
-                    Some("custom_tool_call") | Some("web_search_call") | None => {}
+                    Some("web_search_call") => {
+                        // Hosted done must not close an open function tool — only record the
+                        // search; flush happens before text / finish / client tools.
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                        let query = web_search_query(&item).unwrap_or_default();
+                        self.note_hosted_search(id, "web_search", query);
+                    }
+                    Some("custom_tool_call") => {
+                        let id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("");
+                        if id.is_empty() {
+                            return;
+                        }
+                        let (name, input) =
+                            self.hosted_custom_calls.remove(id).unwrap_or_else(|| {
+                                let raw = item
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("x_search");
+                                let name = if raw.starts_with("x_") {
+                                    "x_search".to_string()
+                                } else {
+                                    raw.to_string()
+                                };
+                                (name, String::new())
+                            });
+                        // Only x_search is reduced to Anthropic server tools (CCP parity).
+                        if name != "x_search" {
+                            return;
+                        }
+                        let query = serde_json::from_str::<Value>(&input)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("query").and_then(Value::as_str).map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        self.note_hosted_search(id, "x_search", query);
+                    }
+                    None => {}
                     _ => {}
                 }
             }
@@ -954,6 +1221,10 @@ impl Reducer {
         if self.terminal_seen {
             return;
         }
+        // Emit hosted search blocks before any deferred answer text so Claude Code sees the
+        // server_tool_use / *_tool_result pair ahead of the prose.
+        self.flush_hosted_searches(out);
+        self.flush_deferred_text(out);
         self.close_open(out);
         self.emit_remaining_tools(out);
         let stop_reason = if incomplete {
@@ -1052,6 +1323,123 @@ fn error_message(v: &Value) -> String {
         })
         .or_else(|| v.get("message").and_then(Value::as_str))
         .unwrap_or("upstream error")
+        .to_string()
+}
+
+/// Anthropic server-tool ids must look like `srvtoolu_*`.
+fn server_tool_use_id_from_grok_id(id: &str) -> String {
+    let suffix: String = id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{SERVER_TOOL_ID_PREFIX}{suffix}")
+}
+
+fn web_search_query(item: &Value) -> Option<String> {
+    let action = item.get("action")?;
+    if let Some(q) = action.get("query").and_then(Value::as_str) {
+        return Some(q.to_string());
+    }
+    if let Some(queries) = action.get("queries").and_then(Value::as_array) {
+        for q in queries {
+            if let Some(s) = q.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Pull markdown links and bare URLs out of the answer text as a best-effort result list when
+/// Grok does not stream structured search hits.
+fn scrape_search_results_from_text(text: &str) -> Vec<HostedSearchResultItem> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // [title](https://...)
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(']') else {
+            break;
+        };
+        let title = after_open[..close].trim();
+        let after_close = &after_open[close + 1..];
+        if !after_close.starts_with('(') {
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        let after_paren = &after_close[1..];
+        let Some(end) = after_paren.find(')') else {
+            break;
+        };
+        let mut url = after_paren[..end].trim().to_string();
+        trim_trailing_url_punct(&mut url);
+        if (url.starts_with("http://") || url.starts_with("https://")) && seen.insert(url.clone()) {
+            let display = if title.is_empty() {
+                fallback_title_from_url(&url)
+            } else {
+                title.to_string()
+            };
+            results.push(HostedSearchResultItem {
+                title: display,
+                url,
+            });
+        }
+        rest = &after_paren[end + 1..];
+    }
+
+    // Bare URLs not already captured via markdown.
+    let mut rest = text;
+    while let Some(start) = {
+        let http = rest.find("http://");
+        let https = rest.find("https://");
+        match (http, https) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    } {
+        let candidate = &rest[start..];
+        let end = candidate
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | ')' | '|' | '"' | '\''))
+            .unwrap_or(candidate.len());
+        let mut url = candidate[..end].to_string();
+        trim_trailing_url_punct(&mut url);
+        if !url.is_empty() && seen.insert(url.clone()) {
+            results.push(HostedSearchResultItem {
+                title: fallback_title_from_url(&url),
+                url,
+            });
+        }
+        rest = &candidate[end.max(1)..];
+    }
+
+    results
+}
+
+fn trim_trailing_url_punct(url: &mut String) {
+    while url
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
+    {
+        url.pop();
+    }
+}
+
+fn fallback_title_from_url(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
         .to_string()
 }
 
@@ -1600,6 +1988,154 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, ReduceEvent::Finish { stop_reason, .. } if *stop_reason == StopReason::ToolUse))
+        );
+        // Hosted web_search_call mid-stream must not invent a client tool start.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ReduceEvent::ToolStart { name, .. } if name == "web_search"
+            )),
+            "empty web_search_call without id/query should not emit: {events:?}"
+        );
+    }
+
+    #[test]
+    fn web_search_call_emits_server_tool_blocks_before_text() {
+        let mut r = Reducer::new("grok-4.5");
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n",
+            "data: {\"type\":\"response.web_search_call.in_progress\",\"item_id\":\"ws_1\"}\n\n",
+            "data: {\"type\":\"response.web_search_call.searching\",\"item_id\":\"ws_1\"}\n\n",
+            "data: {\"type\":\"response.web_search_call.completed\",\"item_id\":\"ws_1\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"rust news\"}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"See [Example](https://example.com).\"}\n\n",
+            "data: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://docs.rs/tokio\",\"title\":\"Tokio\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+        let events: Vec<_> = r
+            .push(sse.as_bytes())
+            .into_iter()
+            .chain(r.finish())
+            .collect();
+        let result_json = json!([
+            {
+                "type": "web_search_result",
+                "title": "Tokio",
+                "url": "https://docs.rs/tokio"
+            },
+            {
+                "type": "web_search_result",
+                "title": "Example",
+                "url": "https://example.com"
+            }
+        ])
+        .to_string();
+        assert_eq!(
+            events,
+            vec![
+                ReduceEvent::ToolStart {
+                    id: "srvtoolu_ws_1".into(),
+                    name: "web_search".into(),
+                },
+                ReduceEvent::ToolDelta(r#"{"query":"rust news"}"#.into()),
+                ReduceEvent::ToolStop,
+                ReduceEvent::ToolStart {
+                    id: "srvtoolu_ws_1".into(),
+                    name: WEB_SEARCH_RESULT_TOOL.into(),
+                },
+                ReduceEvent::ToolDelta(result_json),
+                ReduceEvent::ToolStop,
+                ReduceEvent::TextStart,
+                ReduceEvent::TextDelta("See [Example](https://example.com).".into()),
+                ReduceEvent::TextStop,
+                ReduceEvent::Finish {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage {
+                        input: 3,
+                        output: 2,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                    response_id: None,
+                    continuation_eligible: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn x_search_custom_tool_call_emits_server_tool_blocks() {
+        let mut r = Reducer::new("grok-4.5");
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"claude-code-proxy\\\"}\"}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"xs_1\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Recent post https://x.com/example/status/1\"}\n\n",
+            "data: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://x.com/example/status/1\",\"title\":\"Example post\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n",
+        );
+        let events: Vec<_> = r
+            .push(sse.as_bytes())
+            .into_iter()
+            .chain(r.finish())
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ReduceEvent::ToolStart { id, name }
+                    if id == "srvtoolu_xs_1" && name == "x_search"
+            )),
+            "x_search server tool: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ReduceEvent::ToolStart { name, .. } if name == X_SEARCH_RESULT_TOOL
+            )),
+            "x_search result block: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ReduceEvent::ToolDelta(s) if s.contains("claude-code-proxy"))),
+            "query in input: {events:?}"
+        );
+        // Search blocks before answer text.
+        let search_pos = events
+            .iter()
+            .position(|e| matches!(e, ReduceEvent::ToolStart { name, .. } if name == "x_search"))
+            .expect("x_search start");
+        let text_pos = events
+            .iter()
+            .position(|e| matches!(e, ReduceEvent::TextStart))
+            .expect("text");
+        assert!(search_pos < text_pos, "search before text: {events:?}");
+    }
+
+    #[test]
+    fn x_keyword_search_normalizes_to_x_search() {
+        let mut r = Reducer::new("grok-4.5");
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"search_1\",\"delta\":\"{\\\"query\\\":\\\"test\\\"}\"}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"search_1\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+        );
+        let events: Vec<_> = r
+            .push(sse.as_bytes())
+            .into_iter()
+            .chain(r.finish())
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ReduceEvent::ToolStart { name, .. } if name == "x_search"
+            )),
+            "x_keyword_search → x_search: {events:?}"
         );
     }
 
