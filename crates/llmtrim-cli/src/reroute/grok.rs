@@ -161,27 +161,102 @@ fn content_blocks(content: &Value) -> Vec<Value> {
     }
 }
 
-fn tool_result_output(block: &Value) -> String {
-    let body = match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("image") => "[image omitted]".to_string(),
-                _ => p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+/// Tool-result images: base64 becomes a data URL; remote URLs stay textual placeholders.
+fn tool_result_image_url(block: &Value) -> Result<String, String> {
+    let Some(source) = block.get("source") else {
+        return Err("[image omitted]".into());
     };
-    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
-        format!("[tool execution error]\n{body}")
-    } else {
-        body
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media = source.get("media_type").and_then(Value::as_str);
+            let data = source.get("data").and_then(Value::as_str);
+            match (media, data) {
+                (Some(media), Some(data)) if !data.is_empty() => {
+                    Ok(format!("data:{media};base64,{data}"))
+                }
+                _ => Err("[image omitted]".into()),
+            }
+        }
+        Some("url") if source.get("url").and_then(Value::as_str).is_some() => {
+            Err("[image omitted: url]".into())
+        }
+        _ => Err("[image omitted]".into()),
+    }
+}
+
+/// Render a `tool_result` into Responses `function_call_output.output`.
+/// Pure text stays a string; base64 images become a content-parts array.
+fn tool_result_output(block: &Value) -> Value {
+    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+
+    match block.get("content") {
+        Some(Value::String(s)) => {
+            let body = if is_error {
+                format!("[tool execution error]\n{s}")
+            } else {
+                s.clone()
+            };
+            Value::String(body)
+        }
+        Some(Value::Array(parts)) => {
+            let mut out: Vec<Value> = Vec::new();
+            let mut has_image = false;
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("image") => match tool_result_image_url(p) {
+                        Ok(url) => {
+                            has_image = true;
+                            out.push(json!({
+                                "type": "input_image",
+                                "image_url": url,
+                            }));
+                        }
+                        Err(placeholder) => {
+                            out.push(json!({
+                                "type": "input_text",
+                                "text": placeholder,
+                            }));
+                        }
+                    },
+                    _ => {
+                        let text = p.get("text").and_then(Value::as_str).unwrap_or_default();
+                        out.push(json!({
+                            "type": "input_text",
+                            "text": text,
+                        }));
+                    }
+                }
+            }
+
+            if !has_image {
+                let body = out
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let body = if is_error {
+                    format!("[tool execution error]\n{body}")
+                } else {
+                    body
+                };
+                return Value::String(body);
+            }
+
+            if is_error {
+                out.insert(
+                    0,
+                    json!({ "type": "input_text", "text": "[tool execution error]" }),
+                );
+            }
+            Value::Array(out)
+        }
+        _ => {
+            if is_error {
+                Value::String("[tool execution error]\n".into())
+            } else {
+                Value::String(String::new())
+            }
+        }
     }
 }
 
@@ -1547,5 +1622,95 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         let text = serde_json::to_string(input).unwrap();
         assert!(text.contains("[image omitted]"), "{text}");
+    }
+
+    #[test]
+    fn tool_result_base64_image_becomes_content_parts() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_img",
+                        "content": [
+                            {"type": "text", "text": "shot"},
+                            {"type": "image", "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "xx"
+                            }}
+                        ]
+                    }]
+                }]
+            }),
+            "grok-4.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,xx"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_text_only_stays_string() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_t",
+                        "content": [
+                            {"type": "text", "text": "a"},
+                            {"type": "text", "text": "b"}
+                        ]
+                    }]
+                }]
+            }),
+            "grok-4.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(body["input"][0]["output"], "a\nb");
+    }
+
+    #[test]
+    fn tool_result_error_prefix_with_image() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_e",
+                        "is_error": true,
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": "yy"
+                            }
+                        }]
+                    }]
+                }]
+            }),
+            "grok-4.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "[tool execution error]"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,yy"}
+            ])
+        );
     }
 }
