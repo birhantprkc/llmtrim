@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Codex `-fast` models request priority service tier.** Incoming ids like `gpt-5.4-mini-fast`
+  already stripped to the base model, but the Responses body never set `service_tier`. Codex
+  upstream requests now send `"service_tier": "priority"` when the client asked for `-fast`
+  (Grok model ids that literally contain `-fast` are unchanged).
+
 - **Codex hosted web search results reach Claude Code.** After the request-side `allowed_tools`
   fix, Codex `web_search_call` items were still dropped on the way back, so the client never saw
   `server_tool_use` / `web_search_tool_result` blocks or `usage.server_tool_use`. The reducer now

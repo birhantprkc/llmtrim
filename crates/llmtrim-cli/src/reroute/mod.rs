@@ -79,7 +79,15 @@ pub(crate) fn build_upstream_for_model(
     }
     let (host, path, body, headers) = match provider {
         SubProvider::Codex => {
-            let b = codex::build_request_body(anthropic_body, &model, session_id)?;
+            // `-fast` is a service-tier hint for Codex (not a model id); Grok ids keep `-fast`
+            // literally and never take this path.
+            let priority = incoming_wants_priority_tier(incoming);
+            let b = codex::build_request_body_with_priority(
+                anthropic_body,
+                &model,
+                session_id,
+                priority,
+            )?;
             let h = codex::request_headers_with_mode(
                 &token.access,
                 token.account_id.as_deref(),
@@ -448,6 +456,13 @@ pub fn normalize_incoming(model: &str) -> (String, bool) {
     }
 }
 
+/// Whether the incoming Anthropic model id requested Codex priority service tier via a trailing
+/// `-fast` (after stripping `[1m]`). Callers must only apply this on the Codex path — Grok model
+/// ids can literally contain `-fast` (e.g. `grok-composer-2.5-fast`).
+pub fn incoming_wants_priority_tier(incoming: &str) -> bool {
+    normalize_incoming(incoming).1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +649,67 @@ mod tests {
             parsed["tool_choice"]["tools"],
             serde_json::json!([{ "type": "web_search" }])
         );
+    }
+
+    #[test]
+    fn codex_fast_suffix_sets_priority_service_tier() {
+        let token = auth::TokenSet {
+            access: "tok".into(),
+            account_id: None,
+        };
+        let body = serde_json::json!({
+            "model": "gpt-5.4-mini-fast",
+            "messages": []
+        });
+        let up = build_upstream(SubProvider::Codex, &body, &BTreeMap::new(), &token, None)
+            .expect("build");
+        assert_eq!(up.model, "gpt-5.4-mini");
+        let parsed: serde_json::Value = serde_json::from_slice(&up.body).expect("json");
+        assert_eq!(parsed["model"], "gpt-5.4-mini");
+        assert_eq!(parsed["service_tier"], "priority");
+    }
+
+    #[test]
+    fn codex_non_fast_omits_service_tier() {
+        let token = auth::TokenSet {
+            access: "tok".into(),
+            account_id: None,
+        };
+        let body = serde_json::json!({
+            "model": "gpt-5.4-mini",
+            "messages": []
+        });
+        let up = build_upstream(SubProvider::Codex, &body, &BTreeMap::new(), &token, None)
+            .expect("build");
+        let parsed: serde_json::Value = serde_json::from_slice(&up.body).expect("json");
+        assert_eq!(parsed["model"], "gpt-5.4-mini");
+        assert!(parsed.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn grok_fast_model_id_keeps_literal_suffix_without_service_tier() {
+        let token = auth::TokenSet {
+            access: "tok".into(),
+            account_id: None,
+        };
+        let body = serde_json::json!({
+            "model": "grok-composer-2.5-fast",
+            "messages": []
+        });
+        let up = build_upstream(SubProvider::Grok, &body, &BTreeMap::new(), &token, None)
+            .expect("build");
+        assert_eq!(up.model, "grok-composer-2.5-fast");
+        let parsed: serde_json::Value = serde_json::from_slice(&up.body).expect("json");
+        assert_eq!(parsed["model"], "grok-composer-2.5-fast");
+        assert!(parsed.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn incoming_wants_priority_tier_detects_fast_suffix() {
+        assert!(incoming_wants_priority_tier("gpt-5.4-mini-fast"));
+        assert!(incoming_wants_priority_tier("gpt-5.5-fast[1m]"));
+        assert!(!incoming_wants_priority_tier("gpt-5.4-mini"));
+        // Grok ids also end in -fast; the helper reports true, but only the Codex path applies it.
+        assert!(incoming_wants_priority_tier("grok-composer-2.5-fast"));
     }
 }
