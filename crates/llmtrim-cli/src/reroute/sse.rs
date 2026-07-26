@@ -56,7 +56,12 @@ impl Usage {
 /// array) + `ToolStop` into Anthropic `web_search_tool_result`. Not a real client tool.
 pub const WEB_SEARCH_RESULT_TOOL: &str = "web_search_tool_result";
 
-/// Hosted web_search server-tool ids always use this Anthropic-style prefix.
+/// Sentinel for a hosted X/Twitter search *result* block (Grok `x_search`). Same ToolStart /
+/// ToolDelta / ToolStop encoding as [`WEB_SEARCH_RESULT_TOOL`], but the Anthropic content block
+/// type is `x_search_tool_result`.
+pub const X_SEARCH_RESULT_TOOL: &str = "x_search_tool_result";
+
+/// Hosted web_search / x_search server-tool ids always use this Anthropic-style prefix.
 pub const SERVER_TOOL_ID_PREFIX: &str = "srvtoolu_";
 
 /// A single normalized event from a provider reducer, in emission order. The encoder relies on
@@ -64,12 +69,13 @@ pub const SERVER_TOOL_ID_PREFIX: &str = "srvtoolu_";
 /// interleave (thinking closes before text opens, etc.). Reducers are responsible for closing an
 /// open block before opening another — the encoder only assigns indices.
 ///
-/// Hosted web search is encoded with the existing tool events (keeps the public API patch-stable):
-/// - `ToolStart { id: "srvtoolu_…", name: "web_search" }` → Anthropic `server_tool_use`
+/// Hosted search is encoded with the existing tool events (keeps the public API patch-stable):
+/// - `ToolStart { id: "srvtoolu_…", name: "web_search" | "x_search" }` → Anthropic `server_tool_use`
 /// - `ToolDelta` → `input_json_delta` for the query
 /// - `ToolStop` closes that block
-/// - `ToolStart { id: tool_use_id, name: WEB_SEARCH_RESULT_TOOL }` + `ToolDelta` (JSON array of
-///   `{title,url}`) + `ToolStop` → `web_search_tool_result`
+/// - `ToolStart { id: tool_use_id, name: WEB_SEARCH_RESULT_TOOL | X_SEARCH_RESULT_TOOL }` +
+///   `ToolDelta` (JSON array of `{title,url}`) + `ToolStop` → `web_search_tool_result` /
+///   `x_search_tool_result`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReduceEvent {
     ThinkingStart,
@@ -119,11 +125,17 @@ pub struct AnthropicSseEncoder {
     stopped: bool,
     /// Open tool kind so ToolDelta/ToolStop know how to render.
     open_tool: OpenTool,
-    /// Buffered JSON for a pending `web_search_tool_result` (results land in content_block_start).
+    /// Buffered JSON for a pending hosted-search result (results land in content_block_start).
     pending_result_id: Option<String>,
     pending_result_json: String,
+    /// Anthropic content-block type for the pending result (`web_search_tool_result` / …).
+    pending_result_type: Option<&'static str>,
     /// Hosted web_search server tools opened this turn (for `usage.server_tool_use`).
     web_search_requests: i64,
+    /// Hosted x_search server tools opened this turn (Grok). Folded into
+    /// `usage.server_tool_use.web_search_requests` (total hosted) and also reported as
+    /// `x_search_requests` (claude-code-proxy parity; Anthropic schema only documents web).
+    x_search_requests: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +143,10 @@ enum OpenTool {
     None,
     /// Client function tool → Anthropic `tool_use`.
     Function,
-    /// Hosted web_search → Anthropic `server_tool_use`.
-    ServerWebSearch,
+    /// Hosted web_search / x_search → Anthropic `server_tool_use`.
+    ServerSearch,
     /// Buffered result block (emitted on ToolStop).
-    WebSearchResult,
+    HostedSearchResult,
 }
 
 impl AnthropicSseEncoder {
@@ -149,7 +161,9 @@ impl AnthropicSseEncoder {
             open_tool: OpenTool::None,
             pending_result_id: None,
             pending_result_json: String::new(),
+            pending_result_type: None,
             web_search_requests: 0,
+            x_search_requests: 0,
         }
     }
 
@@ -185,12 +199,22 @@ impl AnthropicSseEncoder {
             ReduceEvent::TextStop => self.close_block(out),
             ReduceEvent::ToolStart { id, name } => {
                 if name == WEB_SEARCH_RESULT_TOOL {
-                    self.open_tool = OpenTool::WebSearchResult;
+                    self.open_tool = OpenTool::HostedSearchResult;
                     self.pending_result_id = Some(id.clone());
                     self.pending_result_json.clear();
-                } else if name == "web_search" && id.starts_with(SERVER_TOOL_ID_PREFIX) {
-                    self.web_search_requests += 1;
-                    self.open_tool = OpenTool::ServerWebSearch;
+                    self.pending_result_type = Some(WEB_SEARCH_RESULT_TOOL);
+                } else if name == X_SEARCH_RESULT_TOOL {
+                    self.open_tool = OpenTool::HostedSearchResult;
+                    self.pending_result_id = Some(id.clone());
+                    self.pending_result_json.clear();
+                    self.pending_result_type = Some(X_SEARCH_RESULT_TOOL);
+                } else if is_hosted_server_tool(name, id) {
+                    if name == "x_search" {
+                        self.x_search_requests += 1;
+                    } else {
+                        self.web_search_requests += 1;
+                    }
+                    self.open_tool = OpenTool::ServerSearch;
                     let idx = self.open_block(
                         out,
                         json!({"type": "server_tool_use", "id": id, "name": name, "input": {}}),
@@ -206,16 +230,20 @@ impl AnthropicSseEncoder {
                 }
             }
             ReduceEvent::ToolDelta(partial) => match self.open_tool {
-                OpenTool::WebSearchResult => self.pending_result_json.push_str(partial),
-                OpenTool::Function | OpenTool::ServerWebSearch => self.block_delta(
+                OpenTool::HostedSearchResult => self.pending_result_json.push_str(partial),
+                OpenTool::Function | OpenTool::ServerSearch => self.block_delta(
                     out,
                     json!({"type": "input_json_delta", "partial_json": partial}),
                 ),
                 OpenTool::None => {}
             },
             ReduceEvent::ToolStop => match self.open_tool {
-                OpenTool::WebSearchResult => {
+                OpenTool::HostedSearchResult => {
                     let tool_use_id = self.pending_result_id.take().unwrap_or_default();
+                    let result_type = self
+                        .pending_result_type
+                        .take()
+                        .unwrap_or(WEB_SEARCH_RESULT_TOOL);
                     let content: Value = serde_json::from_str(&self.pending_result_json)
                         .unwrap_or_else(|_| json!([]));
                     self.pending_result_json.clear();
@@ -223,7 +251,7 @@ impl AnthropicSseEncoder {
                     let idx = self.open_block(
                         out,
                         json!({
-                            "type": "web_search_tool_result",
+                            "type": result_type,
                             "tool_use_id": tool_use_id,
                             "content": content,
                         }),
@@ -231,7 +259,7 @@ impl AnthropicSseEncoder {
                     self.current_index = idx;
                     self.close_block(out);
                 }
-                OpenTool::Function | OpenTool::ServerWebSearch => {
+                OpenTool::Function | OpenTool::ServerSearch => {
                     self.open_tool = OpenTool::None;
                     self.close_block(out);
                 }
@@ -302,11 +330,21 @@ impl AnthropicSseEncoder {
         }
         self.stopped = true;
         let mut usage_json = usage.to_json();
-        if self.web_search_requests > 0 {
-            usage_json.as_object_mut().expect("object").insert(
-                "server_tool_use".into(),
-                json!({ "web_search_requests": self.web_search_requests }),
-            );
+        // Total hosted searches go in the documented Anthropic field; x_search is also reported
+        // separately (claude-code-proxy parity) when present.
+        let hosted_total = self.web_search_requests + self.x_search_requests;
+        if hosted_total > 0 {
+            let mut server = json!({ "web_search_requests": hosted_total });
+            if self.x_search_requests > 0 {
+                server
+                    .as_object_mut()
+                    .expect("object")
+                    .insert("x_search_requests".into(), json!(self.x_search_requests));
+            }
+            usage_json
+                .as_object_mut()
+                .expect("object")
+                .insert("server_tool_use".into(), server);
         }
         let delta = json!({
             "type": "message_delta",
@@ -326,6 +364,12 @@ impl AnthropicSseEncoder {
         });
         frame(out, "error", &data);
     }
+}
+
+/// Hosted server tools Claude Code understands as `server_tool_use` when the id uses the
+/// Anthropic `srvtoolu_` prefix.
+fn is_hosted_server_tool(name: &str, id: &str) -> bool {
+    id.starts_with(SERVER_TOOL_ID_PREFIX) && (name == "web_search" || name == "x_search")
 }
 
 /// Encode one Anthropic SSE frame (`event:` + `data:` line + blank line) onto `out`. Anthropic
@@ -495,6 +539,50 @@ mod tests {
         assert!(out.contains("\"url\":\"https://rust-lang.github.io/async-book/\""));
         assert!(out.contains("\"web_search_requests\":1"));
         assert!(out.contains("\"server_tool_use\""));
+    }
+
+    #[test]
+    fn x_search_blocks_and_usage_encode() {
+        let results = json!([
+            {
+                "type": "web_search_result",
+                "title": "Example post",
+                "url": "https://x.com/example/status/1"
+            }
+        ]);
+        let out = encode_all(
+            "m",
+            &[
+                ReduceEvent::ToolStart {
+                    id: "srvtoolu_xs_1".into(),
+                    name: "x_search".into(),
+                },
+                ReduceEvent::ToolDelta(r#"{"query":"claude-code-proxy"}"#.into()),
+                ReduceEvent::ToolStop,
+                ReduceEvent::ToolStart {
+                    id: "srvtoolu_xs_1".into(),
+                    name: X_SEARCH_RESULT_TOOL.into(),
+                },
+                ReduceEvent::ToolDelta(results.to_string()),
+                ReduceEvent::ToolStop,
+                ReduceEvent::Finish {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage {
+                        input: 1,
+                        output: 2,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                    response_id: None,
+                    continuation_eligible: true,
+                },
+            ],
+        );
+        assert!(out.contains("\"type\":\"server_tool_use\""));
+        assert!(out.contains("\"name\":\"x_search\""));
+        assert!(out.contains("\"type\":\"x_search_tool_result\""));
+        assert!(out.contains("\"web_search_requests\":1"));
+        assert!(out.contains("\"x_search_requests\":1"));
     }
 
     #[test]
