@@ -362,7 +362,7 @@ Same engine, no proxy required. No extra model calls; compress runs in-process.
 | Rust | `cargo add llmtrim-core` |
 | Python | `pip install llmtrim` |
 | Ruby | `gem install llmtrim` |
-| Kotlin | `implementation("io.github.fkiene:llmtrim:0.11.9")` |
+| Kotlin | `implementation("io.github.fkiene:llmtrim:0.11.10")` |
 | Swift | SwiftPM `fkiene/llmtrim-swift` ≥ 0.1.8 |
 | JS / TS | `@llmtrim/js` (WASM) |
 
