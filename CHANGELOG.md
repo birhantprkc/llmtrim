@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-07-26
+
 ### Fixed
 
 - **Sub streams no longer die to Claude Code's ~180s stall watchdog.** Quiet Codex/Grok/Kimi
@@ -1404,7 +1406,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.11.10...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.11.11...HEAD
+[0.11.11]: https://github.com/fkiene/llmtrim/compare/v0.11.10...v0.11.11
 [0.11.10]: https://github.com/fkiene/llmtrim/compare/v0.11.9...v0.11.10
 [0.11.9]: https://github.com/fkiene/llmtrim/compare/v0.11.8...v0.11.9
 [0.11.8]: https://github.com/fkiene/llmtrim/compare/v0.11.7...v0.11.8
