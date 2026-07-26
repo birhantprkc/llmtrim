@@ -35,11 +35,22 @@ const WEB_SEARCH_TOOL: &str = "web_search_20250305";
 ///
 /// `model` is already resolved to the upstream id (the caller stripped `[1m]`/`-fast` and mapped
 /// tiers). `session_id` is the `x-claude-code-session-id` header value if present; it becomes the
-/// Responses `prompt_cache_key`.
+/// Responses `prompt_cache_key`. Convenience wrapper: no priority service tier.
 pub fn build_request_body(
     anthropic: &Value,
     model: &str,
     session_id: Option<&str>,
+) -> Result<Value> {
+    build_request_body_with_priority(anthropic, model, session_id, false)
+}
+
+/// Like [`build_request_body`], but when `priority` is true sets `service_tier: "priority"`
+/// (Codex mapping for an incoming model id ending in `-fast`).
+pub(crate) fn build_request_body_with_priority(
+    anthropic: &Value,
+    model: &str,
+    session_id: Option<&str>,
+    priority: bool,
 ) -> Result<Value> {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -76,6 +87,11 @@ pub fn build_request_body(
 
     if let Some(sid) = session_id {
         body.insert("prompt_cache_key".into(), json!(sid));
+    }
+
+    // Incoming `-fast` (stripped by the caller) maps to Codex priority service tier, not a model id.
+    if priority {
+        body.insert("service_tier".into(), json!("priority"));
     }
 
     // text = { verbosity, format? }
@@ -1745,6 +1761,22 @@ mod tests {
         let body = build_request_body(&json!({ "messages": [] }), "gpt-5.5", None).expect("build");
         assert!(body.get("reasoning").is_none());
         assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn priority_flag_sets_service_tier() {
+        let body = build_request_body_with_priority(
+            &json!({ "messages": [] }),
+            "gpt-5.4-mini",
+            None,
+            true,
+        )
+        .expect("build");
+        assert_eq!(body["model"], "gpt-5.4-mini");
+        assert_eq!(body["service_tier"], "priority");
+        let plain =
+            build_request_body(&json!({ "messages": [] }), "gpt-5.4-mini", None).expect("build");
+        assert!(plain.get("service_tier").is_none());
     }
 
     #[test]
