@@ -152,28 +152,123 @@ fn image_url(block: &Value) -> Option<String> {
     }
 }
 
-/// Render a `tool_result` block's content into the Responses `function_call_output.output` string.
-fn tool_result_output(block: &Value) -> String {
-    let body = match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("image") => "[image omitted]".to_string(),
-                _ => p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+/// Tool-result images: base64 becomes a data URL; remote URLs stay textual placeholders
+/// (Responses accepts remote user-message images more readily than tool images).
+fn tool_result_image_url(block: &Value) -> Result<String, String> {
+    let Some(source) = block.get("source") else {
+        return Err("[image omitted]".into());
     };
-    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
-        format!("[tool execution error]\n{body}")
-    } else {
-        body
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media = source.get("media_type").and_then(Value::as_str);
+            let data = source.get("data").and_then(Value::as_str);
+            match (media, data) {
+                (Some(media), Some(data)) if !data.is_empty() => {
+                    Ok(format!("data:{media};base64,{data}"))
+                }
+                _ => Err("[image omitted]".into()),
+            }
+        }
+        Some("url") if source.get("url").and_then(Value::as_str).is_some() => {
+            Err("[image omitted: url]".into())
+        }
+        _ => Err("[image omitted]".into()),
+    }
+}
+
+/// Render a `tool_result` block into Responses `function_call_output.output`.
+///
+/// Pure text stays a string for wire compatibility with existing clients/tests. When the content
+/// array carries base64 images, output becomes a content-parts array mixing `input_text` and
+/// `input_image` (matching the Codex Responses API).
+fn tool_result_output(block: &Value) -> Value {
+    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+
+    match block.get("content") {
+        Some(Value::String(s)) => {
+            let body = if is_error {
+                format!("[tool execution error]\n{s}")
+            } else {
+                s.clone()
+            };
+            Value::String(body)
+        }
+        Some(Value::Array(parts)) => {
+            let mut out: Vec<Value> = Vec::new();
+            let mut has_image = false;
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("image") => match tool_result_image_url(p) {
+                        Ok(url) => {
+                            has_image = true;
+                            out.push(json!({
+                                "type": "input_image",
+                                "image_url": url,
+                            }));
+                        }
+                        Err(placeholder) => {
+                            out.push(json!({
+                                "type": "input_text",
+                                "text": placeholder,
+                            }));
+                        }
+                    },
+                    _ => {
+                        let text = p.get("text").and_then(Value::as_str).unwrap_or_default();
+                        out.push(json!({
+                            "type": "input_text",
+                            "text": text,
+                        }));
+                    }
+                }
+            }
+
+            if !has_image {
+                let body = out
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let body = if is_error {
+                    format!("[tool execution error]\n{body}")
+                } else {
+                    body
+                };
+                return Value::String(body);
+            }
+
+            if is_error {
+                out.insert(
+                    0,
+                    json!({ "type": "input_text", "text": "[tool execution error]" }),
+                );
+            }
+            Value::Array(out)
+        }
+        _ => {
+            if is_error {
+                Value::String("[tool execution error]\n".into())
+            } else {
+                Value::String(String::new())
+            }
+        }
+    }
+}
+
+/// Append a note onto a tool-result `output` that may be a string or a content-parts array.
+fn append_tool_result_note(output: &mut Value, note: &str) {
+    match output {
+        Value::String(s) => {
+            s.push_str("\n\n");
+            s.push_str(note);
+        }
+        Value::Array(parts) => {
+            parts.push(json!({
+                "type": "input_text",
+                "text": format!("\n\n{note}"),
+            }));
+        }
+        _ => {}
     }
 }
 
@@ -265,8 +360,8 @@ fn build_input(anthropic: &Value) -> Vec<Value> {
                             if let Some(rw) =
                                 crate::reroute::read_rewrite::read_offset_rewrite(call_id)
                             {
-                                output.push_str("\n\n");
-                                output.push_str(
+                                append_tool_result_note(
+                                    &mut output,
                                     &crate::reroute::read_rewrite::read_offset_rewrite_note(&rw),
                                 );
                             }
@@ -1544,6 +1639,125 @@ mod tests {
         )
         .expect("build");
         assert_eq!(body["input"][0]["output"], "[tool execution error]\nboom");
+    }
+
+    #[test]
+    fn tool_result_base64_image_becomes_content_parts() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_img",
+                        "content": [
+                            {"type": "text", "text": "before"},
+                            {"type": "image", "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "AAAA"
+                            }},
+                            {"type": "text", "text": "after"}
+                        ]
+                    }]
+                }]
+            }),
+            "gpt-5.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "input_text", "text": "after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_text_only_stays_string() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_text",
+                        "content": [
+                            {"type": "text", "text": "first"},
+                            {"type": "text", "text": "second"}
+                        ]
+                    }]
+                }]
+            }),
+            "gpt-5.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(body["input"][0]["output"], "first\nsecond");
+    }
+
+    #[test]
+    fn tool_result_error_prefix_precedes_image() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_err_img",
+                        "is_error": true,
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "BBBB"
+                            }
+                        }]
+                    }]
+                }]
+            }),
+            "gpt-5.5",
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "[tool execution error]"},
+                {"type": "input_image", "image_url": "data:image/png;base64,BBBB"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_url_image_becomes_placeholder() {
+        let body = build_request_body(
+            &json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_url",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.invalid/a.png"
+                            }
+                        }]
+                    }]
+                }]
+            }),
+            "gpt-5.5",
+            None,
+        )
+        .expect("build");
+        // No real image part → string wire form with the CCP-style placeholder.
+        assert_eq!(body["input"][0]["output"], "[image omitted: url]");
     }
 
     #[test]

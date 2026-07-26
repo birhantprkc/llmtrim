@@ -271,23 +271,85 @@ fn build_tool_result(block: &Value) -> Value {
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut content = tool_result_text(block.get("content"));
-    if is_error {
-        content = format!("[tool execution error]\n{content}");
-    }
+    let content = tool_result_content(block.get("content"), is_error);
     json!({"role": "tool", "tool_call_id": tool_call_id, "content": content})
 }
 
-/// A `tool_result` content is a string or an array of blocks; flatten to text.
-fn tool_result_text(content: Option<&Value>) -> String {
+/// A `tool_result` content is a string or an array of blocks.
+/// Pure text stays a string; when images are present, content becomes a parts array
+/// (`text` + `image_url`) so multimodal tool results reach Kimi.
+fn tool_result_content(content: Option<&Value>, is_error: bool) -> Value {
     match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+        Some(Value::String(s)) => {
+            let body = if is_error {
+                format!("[tool execution error]\n{s}")
+            } else {
+                s.clone()
+            };
+            Value::String(body)
+        }
+        Some(Value::Array(blocks)) => {
+            let mut parts: Vec<Value> = Vec::new();
+            let mut has_image = false;
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let text = b.get("text").and_then(Value::as_str).unwrap_or("");
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    Some("image") => {
+                        if let Some(url) = image_url(b.get("source")) {
+                            has_image = true;
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": url},
+                            }));
+                        } else {
+                            parts.push(json!({
+                                "type": "text",
+                                "text": "[image omitted]",
+                            }));
+                        }
+                    }
+                    Some(other) => {
+                        parts.push(json!({
+                            "type": "text",
+                            "text": format!("[unsupported content block omitted: {other}]"),
+                        }));
+                    }
+                    None => {}
+                }
+            }
+
+            if !has_image {
+                let body = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let body = if is_error {
+                    format!("[tool execution error]\n{body}")
+                } else {
+                    body
+                };
+                return Value::String(body);
+            }
+
+            if is_error {
+                parts.insert(
+                    0,
+                    json!({"type": "text", "text": "[tool execution error]\n"}),
+                );
+            }
+            Value::Array(parts)
+        }
+        _ => {
+            if is_error {
+                Value::String("[tool execution error]\n".into())
+            } else {
+                Value::String(String::new())
+            }
+        }
     }
 }
 
@@ -718,6 +780,75 @@ mod tests {
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
         assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn tool_result_base64_image_becomes_parts_array() {
+        let out = body(json!({
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [
+                    {"type": "text", "text": "caption"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc"
+                    }},
+                ]
+            }]}],
+        }));
+        let tool = &out["messages"][0];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "toolu_1");
+        let content = tool["content"].as_array().expect("parts array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "caption");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,abc");
+    }
+
+    #[test]
+    fn tool_result_text_only_stays_string() {
+        let out = body(json!({
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_t",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                ]
+            }]}],
+        }));
+        assert_eq!(out["messages"][0]["content"], "first\nsecond");
+    }
+
+    #[test]
+    fn tool_result_error_prefix_with_image() {
+        let out = body(json!({
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_e",
+                "is_error": true,
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "ZZ"
+                    }
+                }]
+            }]}],
+        }));
+        let content = out["messages"][0]["content"].as_array().expect("parts");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "[tool execution error]\n");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,ZZ");
     }
 
     #[test]

@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Tool-result images reach Codex/Kimi/Grok.** User-message images were already translated, but
+  Anthropic `tool_result` content with base64 `image` blocks was dropped (`[image omitted]` on
+  Codex/Grok, text-only flatten on Kimi). Base64 tool images now emit Responses
+  `input_image` parts (Codex/Grok) or chat-completions `image_url` parts (Kimi); pure-text
+  tool results stay a string. Remote-URL tool images remain textual placeholders.
+
 - **Codex `-fast` models request priority service tier.** Incoming ids like `gpt-5.4-mini-fast`
   already stripped to the base model, but the Responses body never set `service_tier`. Codex
   upstream requests now send `"service_tier": "priority"` when the client asked for `-fast`
