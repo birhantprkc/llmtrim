@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-07-27
+
 ### Fixed
 
 - **`llmtrim setup` supports the fish shell.** Setup only knew bash/zsh/`.profile` and always
@@ -1418,7 +1420,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.11.11...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.11.12...HEAD
+[0.11.12]: https://github.com/fkiene/llmtrim/compare/v0.11.11...v0.11.12
 [0.11.11]: https://github.com/fkiene/llmtrim/compare/v0.11.10...v0.11.11
 [0.11.10]: https://github.com/fkiene/llmtrim/compare/v0.11.9...v0.11.10
 [0.11.9]: https://github.com/fkiene/llmtrim/compare/v0.11.8...v0.11.9
