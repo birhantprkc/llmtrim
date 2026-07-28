@@ -555,6 +555,80 @@ mod tests {
     }
 
     #[test]
+    fn agent_preset_shapes_tool_result_at_cache_write_boundary() {
+        let cached_log = (0..80)
+            .map(|i| format!("INFO old step {i} routine nominal pass"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let arriving_log = (0..80)
+            .map(|i| format!("\x1b[90mDEBUG new worker {i} idle waiting for work\x1b[0m"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\nordinary future-critical detail sentinel_delta_47"
+            + "\nERROR failure in the arriving result";
+        let input = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "old", "content": cached_log,
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "new", "name": "shell", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "new", "content": arriving_log}
+                ]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "budget reminder",
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+            ],
+            "max_tokens": 1024,
+        })
+        .to_string();
+
+        let cfg = config::DenseConfig::preset("agent").expect("agent preset");
+        let result =
+            compress_with_config(&input, Some(ProviderKind::Anthropic), &cfg).expect("compress");
+        let body: Value = serde_json::from_str(&result.request_json).unwrap();
+
+        assert_eq!(
+            body.pointer("/messages/0/content/0/content")
+                .and_then(Value::as_str),
+            Some(cached_log.as_str()),
+            "an older cache entry stays byte-identical"
+        );
+        let shaped = body
+            .pointer("/messages/2/content/0/content")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            shaped.len() < arriving_log.len(),
+            "the arriving result was shaped before its cache write ({} -> {})",
+            arriving_log.len(),
+            shaped.len()
+        );
+        assert!(
+            shaped.contains("sentinel_delta_47")
+                && shaped.contains("DEBUG new worker 47 idle waiting for work"),
+            "ordinary details and literal template values must survive boundary shaping: {shaped}"
+        );
+        assert!(
+            !shaped.contains("omitted"),
+            "cache-boundary shaping must never emit a lossy omission marker: {shaped}"
+        );
+        let counter =
+            tokenizer::counter_for(ProviderKind::Anthropic, result.model.as_deref()).unwrap();
+        let expected_frozen =
+            counter.count(&cached_log) + counter.count(shaped) + counter.count("budget reminder");
+        assert_eq!(
+            result.frozen_input_tokens.0, expected_frozen,
+            "the frozen-zone meter must describe the normalized bytes actually forwarded"
+        );
+    }
+
+    #[test]
     fn frozen_prefix_untouched_while_live_zone_compresses() {
         // message 0 is the cached prefix (`cache_control`) holding a big log; message 1 is
         // the live user turn with another big log. The agent preset must compress the live

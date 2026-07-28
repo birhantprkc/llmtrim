@@ -4,9 +4,11 @@
 //! prefix), the provider caches everything up to the last marker and bills it at ~0.1×.
 //! Rewriting that content — even to save tokens — changes the cached bytes and busts the
 //! cache, which usually costs *more* than the tokens saved (the "input compression is a
-//! false economy" trap). So the content-mutating stages compress only the **live zone**:
-//! the segments after the last `cache_control` marker. Each new tool result is therefore
-//! compressed exactly once — when it first arrives in the live zone — then frozen.
+//! false economy" trap). So content-mutating stages ordinarily compress only the **live zone**:
+//! the segments after the last `cache_control` marker. Tool output has one narrow exception: a
+//! tool result in the final marked message receives terminal-equivalent normalization as that
+//! cache entry is first written, then the turn memo replays the emitted bytes verbatim. Template
+//! folding and lossy windowing remain confined to the live zone.
 //!
 //! No markers ⇒ no known cache ⇒ everything is compressible (behavior unchanged):
 //! determinism keeps an identical prefix cache-stable across calls, and Stage A's OpenAI
@@ -29,6 +31,32 @@ pub fn compressible_pointers(req: &Request, provider: &dyn Provider) -> Vec<Stri
         .content_text_pointers(req)
         .into_iter()
         .filter(|p| !frozen.contains(p) && !is_instruction(req, provider, p))
+        .collect()
+}
+
+/// Tool-result pointers entering the cache at the final breakpoint. Claude Code may append a
+/// system reminder carrying the marker after the result, so skip those trailing system messages
+/// and select the adjacent tool-result message. Lossy transforms remain confined to the live zone.
+pub fn first_arrival_tool_result_pointers(req: &Request, provider: &dyn Provider) -> Vec<String> {
+    let Some(messages) = req.raw().get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(mut boundary) = messages.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    if !has_cache_control(&messages[boundary]) {
+        return Vec::new();
+    }
+    while boundary > 0 && messages[boundary].get("role").and_then(Value::as_str) == Some("system") {
+        boundary -= 1;
+    }
+    let prefix = format!("/messages/{boundary}/");
+    provider
+        .content_text_pointers(req)
+        .into_iter()
+        .filter(|pointer| {
+            pointer.starts_with(&prefix) && crate::provider::is_tool_result_ptr(req, pointer)
+        })
         .collect()
 }
 
@@ -195,6 +223,73 @@ mod tests {
         let frozen = frozen_pointers(&r, p.as_ref());
         assert!(frozen.contains("/messages/0/content/0/text"));
         assert!(frozen.contains("/messages/1/content/0/text"));
+    }
+
+    #[test]
+    fn newest_marked_tool_result_is_available_only_to_write_path() {
+        let r = req(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "old", "content": "old cached output",
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "new", "name": "shell", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "new-a", "content": "new output A"},
+                    {"type": "tool_result", "tool_use_id": "new-b", "content": "new output B",
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+            ]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+
+        assert!(compressible_pointers(&r, p.as_ref()).is_empty());
+        assert_eq!(
+            first_arrival_tool_result_pointers(&r, p.as_ref()),
+            vec![
+                "/messages/2/content/0/content".to_string(),
+                "/messages/2/content/1/content".to_string(),
+            ],
+            "the breakpoint writes the whole final message, including sibling results"
+        );
+    }
+
+    #[test]
+    fn trailing_marked_system_reminder_caches_preceding_tool_result() {
+        let r = req(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "new", "name": "shell", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "new", "content": "new output"}
+                ]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "budget reminder",
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+            ]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+
+        assert_eq!(
+            first_arrival_tool_result_pointers(&r, p.as_ref()),
+            vec!["/messages/1/content/0/content".to_string()]
+        );
+    }
+
+    #[test]
+    fn marked_non_tool_content_stays_frozen_on_write_path() {
+        let r = req(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "do not reshape", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+
+        assert!(first_arrival_tool_result_pointers(&r, p.as_ref()).is_empty());
     }
 
     #[test]
