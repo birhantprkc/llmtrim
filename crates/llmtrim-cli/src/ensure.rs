@@ -30,6 +30,46 @@ pub struct OptOut {
     pub sub_nudge: bool,
 }
 
+/// Sidecar opt-out for routed subagents. Kept out of [`OptOut`] so adding the feature does not
+/// change that constructible public struct (cargo-semver-checks / 0.11.x patch).
+#[cfg(feature = "intercept")]
+mod route_agents_opt_out {
+    use super::*;
+
+    const MARKER: &str = "route-agents.opt-out";
+
+    pub(super) fn opted_out_at(home: &Path) -> bool {
+        home.join(MARKER).is_file()
+    }
+
+    pub(super) fn set_at(home: &Path, value: bool) -> Result<()> {
+        let path = home.join(MARKER);
+        if value {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            std::fs::write(&path, b"").with_context(|| format!("write {}", path.display()))?;
+        } else if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn opted_out() -> bool {
+        crate::daemon::home_dir()
+            .map(|home| opted_out_at(&home))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn set(value: bool) -> Result<()> {
+        set_at(&crate::daemon::home_dir()?, value)
+    }
+}
+
+#[cfg(feature = "intercept")]
+use route_agents_opt_out::opted_out as route_agents_opted_out;
+
 /// Persistent integration state under `~/.llmtrim/integrations.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -190,6 +230,23 @@ fn probe_with(state: &State) -> Vec<Gap> {
                 detail: "stale (binary path)".into(),
             }),
             crate::window_sub::OwnedStatus::Current => {}
+        }
+    }
+
+    #[cfg(feature = "intercept")]
+    if claude && !route_agents_opted_out() {
+        match crate::route_agents::status() {
+            Ok(status) if status.installed == 0 => gaps.push(Gap {
+                id: "route_agents",
+                label: "Subagents".into(),
+                detail: "subscription-routed Claude Code subagents not installed".into(),
+            }),
+            Ok(status) if status.current < status.expected => gaps.push(Gap {
+                id: "route_agents",
+                label: "Subagents".into(),
+                detail: "routed subagent definitions are stale".into(),
+            }),
+            Ok(_) | Err(_) => {}
         }
     }
 
@@ -369,6 +426,47 @@ pub fn apply(opts: Options) -> Result<Report> {
         report
             .rows
             .push((ui::NOTE, "/sub".into(), "opted out".into()));
+    }
+
+    #[cfg(feature = "intercept")]
+    if claude && !route_agents_opted_out() {
+        match crate::route_agents::status() {
+            Ok(status) => {
+                let missing = status.installed == 0;
+                let skip_missing = !opts.install_missing && missing;
+                if !skip_missing {
+                    match crate::route_agents::install() {
+                        Ok(after) => {
+                            if status.current < status.expected {
+                                report.applied.push("route_agents");
+                            }
+                            report.rows.push((
+                                ui::OK,
+                                "Subagents".into(),
+                                format!(
+                                    "{}/{} routed provider/model agents current",
+                                    after.current, after.expected
+                                ),
+                            ));
+                        }
+                        Err(e) => report.rows.push((
+                            ui::WARN,
+                            "Subagents".into(),
+                            format!("not installed: {e:#}"),
+                        )),
+                    }
+                }
+            }
+            Err(e) => report.rows.push((
+                ui::WARN,
+                "Subagents".into(),
+                format!("could not inspect: {e:#}"),
+            )),
+        }
+    } else if claude && route_agents_opted_out() {
+        report
+            .rows
+            .push((ui::NOTE, "Subagents".into(), "opted out".into()));
     }
 
     if claude
@@ -636,6 +734,11 @@ pub fn run_cli(quiet: bool) -> Result<()> {
 
 /// Record an opt-out (e.g. after `guard uninstall`).
 pub fn set_opt_out(id: &str, value: bool) -> Result<()> {
+    // Routed-subagent opt-out is a sidecar file so [`OptOut`]'s public field set stays stable.
+    #[cfg(feature = "intercept")]
+    if matches!(id, "route_agents" | "route-agents" | "agents") {
+        return route_agents_opt_out::set(value);
+    }
     let mut state = State::load()?;
     match id {
         "statusline" => state.opt_out.statusline = value,
@@ -885,5 +988,29 @@ mod tests {
         assert!(!s.opt_out.statusline);
         assert!(!s.opt_out.guard);
         assert!(!s.opt_out.window_sub);
+    }
+
+    #[cfg(feature = "intercept")]
+    #[test]
+    fn route_agents_opt_out_is_sidecar_not_optout_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmtrim-route-agents-opt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!route_agents_opt_out::opted_out_at(&dir));
+        route_agents_opt_out::set_at(&dir, true).unwrap();
+        assert!(route_agents_opt_out::opted_out_at(&dir));
+        assert!(dir.join("route-agents.opt-out").is_file());
+        // Public OptOut shape is unchanged — no route_agents field to set.
+        assert_eq!(State::default().opt_out, OptOut::default());
+        route_agents_opt_out::set_at(&dir, false).unwrap();
+        assert!(!route_agents_opt_out::opted_out_at(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
