@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmtrim status` Sub tab for subscription routing.** The status TUI now has a fourth tab
+  (**Sub**, key `4`) for the always / fallback / off routing policy that used to live only in
+  `llmtrim sub setup` and the config file. Cycle presets with ←/→ (Off, Always→Codex, Always→Kimi,
+  Always→Grok, Fallback) and apply with Enter; press `e` for the Claude-tier map editor
+  (Fable → Opus → Sonnet → Haiku), `s` to save tiers without flipping `active`. Leaving the TUI
+  restarts the daemon and syncs Claude auth when the policy changed. `llmtrim sub setup
+  <provider>` opens status already on Sub with that provider highlighted. Choosing Always→Off
+  clears the skip-login dummy Anthropic token (the previous Always→Off path left `active=off`
+  while still counting as always-on). README status SVGs are a four-frame loop that includes the
+  new tab. (#237)
+
+### Fixed
+
+- **Cost dashboard no longer prices multi-homed models from the wrong provider.**
+  `llm_prices` walked the `llm_providers` registry in PHF hash order and returned the first
+  model-id hit. Shared ids such as `deepseek-v4-pro` therefore priced at Tencent's reseller row
+  ($12 / $24) instead of DeepSeek global USD ($0.435 / $0.87) — a ~27× inflation of
+  `llmtrim status` dollars — and even the primary brand's top-level row is the CNY endpoint.
+  The same class of bug hit Moonshot (`kimi-k2.6` CNY vs USD) and other multi-homed Chinese
+  models. Pricing now builds a one-shot offering table that prefers non-reseller + USD, then
+  reseller + USD, then non-USD, before the embedded `pricing.json` snapshot. `rates_for`
+  (frozen breakdown) inherits the same list rates. (#238)
+
 ## [0.12.0] - 2026-07-29
 
 ### Added
