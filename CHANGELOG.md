@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-29
+
 ### Added
 
 - **Recoverable first-arrival tool-output shaping.** Tool results that freeze into the prompt
@@ -1490,7 +1492,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.11.12...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/fkiene/llmtrim/compare/v0.11.12...v0.12.0
 [0.11.12]: https://github.com/fkiene/llmtrim/compare/v0.11.11...v0.11.12
 [0.11.11]: https://github.com/fkiene/llmtrim/compare/v0.11.10...v0.11.11
 [0.11.10]: https://github.com/fkiene/llmtrim/compare/v0.11.9...v0.11.10
