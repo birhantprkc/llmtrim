@@ -8,14 +8,44 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Recoverable first-arrival tool-output shaping.** Shell-capable agents can now keep a smaller,
-  aggressively selected view of logs, diffs, grep results, and dumps in the prompt cache while the
-  exact raw result remains in bounded daemon memory for five hours by default. An emitted
-  `llmtrim recall r_…` command restores the original bytes on demand. Recovery is enabled by
-  default, forces signal-only (`Aggressive`) selection where the tool-output kind supports it
-  under the ordinary live-zone line budget, works through subscription reroutes, and falls back
-  to normalization-only cache writes when admission or recovery is not available. Set
-  `first_arrival_recall = false` to opt out.
+- **Recoverable first-arrival tool-output shaping.** Tool results that freeze into the prompt
+  cache used to stay full-size for the rest of the session: lossy toolout only ran in the live
+  zone, so a fat log, diff, grep dump, or status paste paid cache-write rates on every later
+  turn. Shell-capable agents now shape a first-arrival tool result **once**, before its first
+  cache write:
+
+  - **Inline view:** signal-only (`Aggressive`) selection where the kind supports it — errors
+    and attached stacks for logs, `+/-` only for diffs; kinds without a signal anchor
+    (grep, plain dumps) still window under the ordinary live-zone line budget, ranked by
+    importance and the request's query words.
+  - **Durable raw:** exact original bytes stay in bounded daemon RAM only (default five hours /
+    256 entries / 64 MiB pool / 8 MiB per entry). Never on disk. Gone on daemon restart.
+  - **On-demand restore:** the shaped body ends with
+    `[llmtrim: full output: llmtrim recall r_…; if unavailable, re-run the tool]`. Run
+    `llmtrim recall r_…` to print the original bytes; a re-run of the same tool also
+    passthroughs without re-compressing (fingerprint rail).
+
+  Recovery is **on by default**, works through subscription reroutes, and falls back to
+  normalization-only cache writes when admission is refused or the control path is down — so a
+  cold or full store never blocks the turn. Opt out with `first_arrival_recall = false` or
+  `LLMTRIM_FIRST_ARRIVAL_RECALL=0`. Size and lifetime knobs:
+  `first_arrival_recall_ttl_secs`, `first_arrival_recall_max_entries`,
+  `first_arrival_recall_max_bytes`, `first_arrival_recall_max_entry_bytes` (and matching
+  `LLMTRIM_FIRST_ARRIVAL_RECALL_*` env vars). (#229, #233, #234, #235, #236)
+
+- **Request-local Claude Code subagents for subscription routing.** Delegate one child turn to
+  Codex, Grok, or Kimi while the parent window stays on Anthropic (or its current `/sub`):
+
+  ```bash
+  llmtrim agents install    # also run by setup, update, and ensure
+  ```
+
+  Then ask naturally — *use a Grok subagent*, *implement it with Terra*, *review with GPT Luna*.
+  Provider-only agents inherit the child's Claude tier through the configured mapping; named
+  model agents pin that provider model. Request-local routes override window `/sub` and global
+  policy **only for that request**. `llmtrim agents status` reports installed vs current;
+  `llmtrim agents uninstall` removes only llmtrim-owned agent files and records an opt-out so
+  `ensure` leaves them gone. (#232)
 
 ### Fixed
 
@@ -30,7 +60,21 @@ All notable changes to this project are documented here. The format follows
   the MITM regardless of how it was launched — the settings analogue of claude-code-proxy
   pinning `ANTHROPIC_BASE_URL` next to its dummy token. Settings deliberately do not gate on
   daemon liveness (unlike the shell block): a temporarily down proxy is a connection error,
-  not a fake `/login` prompt. `llmtrim ensure` upgrades existing installs.
+  not a fake `/login` prompt. `llmtrim ensure` upgrades existing installs. (#228)
+
+- **Sub streams surface real upstream deaths and retry hollow completions.** Multi-minute
+  Codex/Grok/Kimi reasoning failures used to show up only as `incomplete_stream` "client abort"
+  because the hyper cause was discarded, and empty success terminals (Finish with no
+  text/thinking/tools) were forwarded as hollow `end_turn`. Mid-stream transport errors now log
+  `cause` / `open_secs` / `last_event`, SSE error frames are classified separately from client
+  aborts, and empty terminals are retried with full context (bounded + backoff) before anything
+  reaches Claude Code. (#231)
+
+- **Cold-cache guard no longer blocks local-only `/sub`.** After a long idle gap,
+  `UserPromptSubmit` was stopping `/sub on codex` even though the skill is bang-shell only
+  (`disable-model-invocation`) and never rewrites the prompt cache. Slash names shared with
+  window_sub now pass through without acking the gap, so the next real chat prompt still
+  warns. (#230)
 
 ## [0.11.12] - 2026-07-27
 
