@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Historical turns frozen at zero rates are backfilled once pricing is known.**
+  #242 priced new `claude-opus-5` turns, but rows written while a model was missing from
+  the embedded snapshot kept `input_rate=0` / `bill_micros=0` forever, so tray and status
+  dollar totals stayed understated after upgrade. On ledger open (at most once per UTC
+  day), distinct zero-rate `(provider, model)` pairs are looked up via `rates_for`; when
+  rates are non-zero, those rows get rates + recomputed `bill_micros`. Still-unknown
+  models stay blank; valid frozen rates are never touched. Self-heals any future
+  snapshot-lag model, not only Opus 5. (#244)
+
 ## [0.12.2] - 2026-07-31
 
 ### Fixed

@@ -1592,6 +1592,8 @@ fn run_sub(_action: SubCmd) -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    // Daily unpriced-turn reprice on ledger open needs CLI pricing (#244).
+    llmtrim::tracking::init_rate_lookup();
     let cli = Cli::parse();
     match cli.command {
         Commands::Compress { provider } => {
