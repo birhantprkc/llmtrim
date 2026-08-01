@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(18_000);
 pub const DEFAULT_MAX_ENTRIES: usize = 256;
@@ -84,7 +83,7 @@ pub struct RecallStore {
 impl RecallStore {
     pub fn new(limits: Limits) -> Self {
         let mut fingerprint_secret = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut fingerprint_secret);
+        rand::fill(&mut fingerprint_secret);
         Self {
             limits,
             inner: Mutex::new(Inner {
@@ -220,7 +219,7 @@ impl RecallStore {
 fn new_handle(inner: &Inner) -> String {
     loop {
         let mut raw = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::fill(&mut raw);
         let handle = format!("r_{}", URL_SAFE_NO_PAD.encode(raw));
         if !inner.entries.contains_key(&handle) {
             return handle;
