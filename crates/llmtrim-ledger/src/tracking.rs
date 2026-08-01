@@ -7,9 +7,25 @@
 //! never block the user's compressed output.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+
+/// `(input, output, cache_read, cache_write)` USD per 1M tokens. All zeros = still unpriced.
+pub type RateLookup = fn(provider: &str, model: Option<&str>) -> (f64, f64, f64, f64);
+
+/// Optional pricing hook set by the CLI (`rates_for`). When unset (tray, tests, bare
+/// ledger), daily zero-rate reprice is a no-op — the data layer stays price-blind.
+static RATE_LOOKUP: OnceLock<RateLookup> = OnceLock::new();
+
+/// Register the process-wide rate lookup used by [`Tracker::maybe_reprice_unpriced_daily`].
+/// First registration wins; later calls are ignored. Call once from CLI startup.
+pub fn register_rate_lookup(f: RateLookup) {
+    let _ = RATE_LOOKUP.set(f);
+}
+
+const ZERO_RATE_CHECK_DAY_KEY: &str = "zero_rate_check_day";
 
 /// One compression event.
 #[derive(Debug, Clone)]
@@ -296,6 +312,8 @@ impl Tracker {
         // restart immediately reclaims a table that grew unbounded under an older build (it
         // checkpoints the WAL when it deletes). A no-op COUNT once the table is within cap.
         let _ = tracker.prune_breakdown(Self::breakdown_turns_cap());
+        // At most one unpriced-model reprice scan per UTC day (needs [`register_rate_lookup`]).
+        let _ = tracker.maybe_reprice_unpriced_daily();
         Ok(tracker)
     }
 
@@ -319,6 +337,8 @@ impl Tracker {
             .with_context(|| format!("failed to open ledger at {}", path.display()))?;
         let tracker = Self { conn };
         tracker.migrate()?;
+        // Daily reprice before query_only so a status open can heal unpriced rows.
+        let _ = tracker.maybe_reprice_unpriced_daily();
         // Read-side tuning; all best-effort (a missing pragma must not break the TUI).
         let _ = tracker.conn.pragma_update(None, "temp_store", "MEMORY");
         let _ = tracker.conn.pragma_update(None, "cache_size", -8000_i64);
@@ -483,6 +503,142 @@ impl Tracker {
                 return Err(e).with_context(|| format!("failed to add ledger column {col}"));
             }
         }
+        // Key/value meta (daily reprice gate, future one-shot flags). Idempotent.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ledger_meta (
+                    key   TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                );",
+            )
+            .context("failed to create ledger_meta")?;
+        Ok(())
+    }
+
+    /// At most once per UTC day: find `(provider, model)` still frozen at zero rates, look
+    /// up prices via [`register_rate_lookup`], and reprice rows that now have non-zero rates.
+    /// Still-unknown models stay unpriced. No lookup registered → no-op. Best-effort: errors
+    /// never fail open. See #244.
+    pub fn maybe_reprice_unpriced_daily(&self) -> Result<()> {
+        let Some(lookup) = RATE_LOOKUP.get() else {
+            return Ok(());
+        };
+        if !self.zero_rate_check_due_today()? {
+            return Ok(());
+        }
+        // Mark first so a slow/failing pass still enforces the once-per-day cap.
+        self.mark_zero_rate_check_today()?;
+        for (provider, model) in self.unpriced_models()? {
+            let (input, output, cache_read, cache_write) = lookup(&provider, Some(&model));
+            if input == 0.0 && output == 0.0 {
+                continue;
+            }
+            let _ = self.reprice_zero_rate_turns(
+                &provider,
+                &model,
+                input,
+                output,
+                cache_read,
+                cache_write,
+            );
+        }
+        Ok(())
+    }
+
+    /// Distinct wire `(provider, model)` with all four rates and `bill_micros` still zero.
+    pub fn unpriced_models(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT provider, model
+                   FROM breakdown_turns
+                  WHERE model IS NOT NULL
+                    AND input_rate = 0
+                    AND output_rate = 0
+                    AND cache_read_rate = 0
+                    AND cache_write_rate = 0
+                    AND bill_micros = 0",
+            )
+            .context("failed to prepare unpriced_models query")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .context("failed to query unpriced models")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read unpriced models")
+    }
+
+    /// Reprice exact `(provider, model)` rows still at zero rates / zero bill.
+    /// Returns rows updated. Valid frozen rates are never touched.
+    pub fn reprice_zero_rate_turns(
+        &self,
+        provider: &str,
+        model: &str,
+        input_rate: f64,
+        output_rate: f64,
+        cache_read_rate: f64,
+        cache_write_rate: f64,
+    ) -> Result<u64> {
+        // bill_micros mirrors serve.rs: tokens × $/1M = micro-USD.
+        let n = self
+            .conn
+            .execute(
+                "UPDATE breakdown_turns
+                    SET input_rate = ?1,
+                        output_rate = ?2,
+                        cache_read_rate = ?3,
+                        cache_write_rate = ?4,
+                        bill_micros = CAST(ROUND(
+                            fresh_input * ?1
+                          + cache_read * ?3
+                          + cache_write * ?4
+                          + output_tok * ?2
+                        ) AS INTEGER)
+                  WHERE provider = ?5
+                    AND model = ?6
+                    AND input_rate = 0
+                    AND output_rate = 0
+                    AND cache_read_rate = 0
+                    AND cache_write_rate = 0
+                    AND bill_micros = 0",
+                params![
+                    input_rate,
+                    output_rate,
+                    cache_read_rate,
+                    cache_write_rate,
+                    provider,
+                    model,
+                ],
+            )
+            .with_context(|| format!("failed to reprice zero-rate turns for {provider}/{model}"))?;
+        Ok(n as u64)
+    }
+
+    fn today_utc() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn zero_rate_check_due_today(&self) -> Result<bool> {
+        let today = Self::today_utc();
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM ledger_meta WHERE key = ?1",
+                params![ZERO_RATE_CHECK_DAY_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("failed to read zero_rate_check_day")?;
+        Ok(last.as_deref() != Some(today.as_str()))
+    }
+
+    fn mark_zero_rate_check_today(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO ledger_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![ZERO_RATE_CHECK_DAY_KEY, Self::today_utc()],
+            )
+            .context("failed to mark zero_rate_check_day")?;
         Ok(())
     }
 
@@ -1401,5 +1557,100 @@ mod tests {
             !is_duplicate_column(&other),
             "non-duplicate error not swallowed"
         );
+    }
+
+    fn test_rate_lookup(provider: &str, model: Option<&str>) -> (f64, f64, f64, f64) {
+        match (provider, model) {
+            ("anthropic", Some("claude-opus-5")) => (5.0, 25.0, 0.5, 6.25),
+            _ => (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    fn seed_zero_rate(t: &Tracker, session: &str, model: &str) {
+        let mut turn = breakdown_turn(session);
+        turn.model = Some(model.into());
+        turn.input_rate = 0.0;
+        turn.output_rate = 0.0;
+        turn.cache_read_rate = 0.0;
+        turn.cache_write_rate = 0.0;
+        turn.bill_micros = 0;
+        turn.fresh_input = 1_000;
+        turn.cache_read = 2_000;
+        turn.cache_write = 100;
+        turn.output_tok = 50;
+        t.record_breakdown(&turn, &[]).unwrap();
+    }
+
+    fn rates_row(t: &Tracker, session: &str) -> (f64, f64, f64, f64, i64) {
+        t.conn
+            .query_row(
+                "SELECT input_rate, output_rate, cache_read_rate, cache_write_rate, bill_micros
+                   FROM breakdown_turns WHERE session_id = ?1",
+                params![session],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn reprice_zero_rate_turns_is_narrowly_guarded() {
+        // Direct UPDATE path: only exact zero-rate rows for that model; priced rows stay put.
+        let t = Tracker::open_in_memory().unwrap();
+        seed_zero_rate(&t, "sess-unpriced", "claude-opus-5");
+
+        let mut priced = breakdown_turn("sess-priced");
+        priced.model = Some("claude-opus-5".into());
+        priced.input_rate = 5.0;
+        priced.output_rate = 25.0;
+        priced.cache_read_rate = 0.5;
+        priced.cache_write_rate = 6.25;
+        priced.bill_micros = 999;
+        t.record_breakdown(&priced, &[]).unwrap();
+
+        seed_zero_rate(&t, "sess-other", "some-future-model");
+
+        let n = t
+            .reprice_zero_rate_turns("anthropic", "claude-opus-5", 5.0, 25.0, 0.5, 6.25)
+            .unwrap();
+        assert_eq!(n, 1);
+        // 1000*5 + 2000*0.5 + 100*6.25 + 50*25 = 7875
+        assert_eq!(
+            rates_row(&t, "sess-unpriced"),
+            (5.0, 25.0, 0.5, 6.25, 7_875)
+        );
+        assert_eq!(rates_row(&t, "sess-priced"), (5.0, 25.0, 0.5, 6.25, 999));
+        assert_eq!(rates_row(&t, "sess-other"), (0.0, 0.0, 0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn daily_reprice_uses_lookup_and_skips_unknown_models() {
+        // #244: once a model is in the price table, zero-rate historical turns heal on open.
+        register_rate_lookup(test_rate_lookup);
+        let t = Tracker::open_in_memory().unwrap();
+        // open_in_memory does not call maybe_reprice; seed then run explicitly.
+        // Clear any mark from a prior test sharing the process OnceLock path.
+        let _ = t.conn.execute("DELETE FROM ledger_meta", []);
+
+        seed_zero_rate(&t, "sess-opus", "claude-opus-5");
+        seed_zero_rate(&t, "sess-unknown", "not-in-price-table");
+
+        t.maybe_reprice_unpriced_daily().unwrap();
+        assert_eq!(rates_row(&t, "sess-opus"), (5.0, 25.0, 0.5, 6.25, 7_875));
+        assert_eq!(rates_row(&t, "sess-unknown"), (0.0, 0.0, 0.0, 0.0, 0));
+
+        // Same-day second pass is a no-op (even if new zero-rate rows appear).
+        seed_zero_rate(&t, "sess-late", "claude-opus-5");
+        t.maybe_reprice_unpriced_daily().unwrap();
+        assert_eq!(rates_row(&t, "sess-late"), (0.0, 0.0, 0.0, 0.0, 0));
+
+        // After rewinding the day mark, the late row is healed.
+        t.conn
+            .execute(
+                "UPDATE ledger_meta SET value = '1970-01-01' WHERE key = ?1",
+                params![ZERO_RATE_CHECK_DAY_KEY],
+            )
+            .unwrap();
+        t.maybe_reprice_unpriced_daily().unwrap();
+        assert_eq!(rates_row(&t, "sess-late"), (5.0, 25.0, 0.5, 6.25, 7_875));
     }
 }
