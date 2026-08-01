@@ -244,9 +244,8 @@ fn pkce_challenge(verifier: &str) -> String {
 
 /// 32 random bytes, base64url-nopad — used for the PKCE verifier and the OAuth `state`.
 fn random_b64url_32() -> String {
-    use rand::RngCore;
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::fill(&mut buf);
     b64url_encode(&buf)
 }
 

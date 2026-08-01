@@ -97,7 +97,7 @@ llm_providers = { version = "0.14", optional = true }
 # over hudsucker's existing aws-lc client via a URI-authority rewrite).
 base64.workspace = true
 sha2 = "0.11"
-rand = "0.8"
+rand = "0.10"
 uuid = { version = "1", features = ["v4"], optional = true }
 # Request-side body decompression (#193): Codex CLI 0.144+ sends its request bodies with
 # `Content-Encoding: zstd`; without decoding them the interceptor can't parse (let alone
