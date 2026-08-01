@@ -112,7 +112,7 @@ flate2 = { version = "1", optional = true }
 time = { version = ">=0.3.36, <0.3.54", default-features = false, optional = true }
 # MCP server over stdio (`mcp`). rmcp is the official Model Context Protocol Rust SDK;
 # `transport-io` is the stdio transport, `macros` derives each tool's JSON Schema.
-rmcp = { version = "2.0", default-features = false, features = [
+rmcp = { version = "3.0", default-features = false, features = [
   "server",
   "macros",
   "transport-io",
@@ -130,7 +130,7 @@ crossterm = { version = "0.29", optional = true }
 # the shipped binary keeps just the server features above.
 [dev-dependencies]
 insta = "1"
-rmcp = { version = "2.0", default-features = false, features = ["client", "transport-io"] }
+rmcp = { version = "3.0", default-features = false, features = ["client", "transport-io"] }
 
 [target.'cfg(not(windows))'.dependencies]
 auto-launch = "0.6.0"
