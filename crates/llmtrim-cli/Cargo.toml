@@ -96,7 +96,7 @@ llm_providers = { version = "0.14", optional = true }
 # ids + the persistent Kimi device id. All small, pure, no new TLS stack (the reroute forwards
 # over hudsucker's existing aws-lc client via a URI-authority rewrite).
 base64.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"], optional = true }
 # Request-side body decompression (#193): Codex CLI 0.144+ sends its request bodies with
