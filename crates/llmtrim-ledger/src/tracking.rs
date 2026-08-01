@@ -609,9 +609,7 @@ impl Tracker {
                     model,
                 ],
             )
-            .with_context(|| {
-                format!("failed to reprice zero-rate turns for {provider}/{model}")
-            })?;
+            .with_context(|| format!("failed to reprice zero-rate turns for {provider}/{model}"))?;
         Ok(n as u64)
     }
 
@@ -1616,7 +1614,10 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // 1000*5 + 2000*0.5 + 100*6.25 + 50*25 = 7875
-        assert_eq!(rates_row(&t, "sess-unpriced"), (5.0, 25.0, 0.5, 6.25, 7_875));
+        assert_eq!(
+            rates_row(&t, "sess-unpriced"),
+            (5.0, 25.0, 0.5, 6.25, 7_875)
+        );
         assert_eq!(rates_row(&t, "sess-priced"), (5.0, 25.0, 0.5, 6.25, 999));
         assert_eq!(rates_row(&t, "sess-other"), (0.0, 0.0, 0.0, 0.0, 0));
     }
