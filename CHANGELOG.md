@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Memo ignores moving `cache_control` markers when matching original prefixes.** Claude Code
+  parks Anthropic `cache_control` on the newest tool_result / message boundary and relocates it
+  every turn. After #254 froze whole items, a multi-`tool_result` user message still missed the
+  original-prefix hash once the marker left that message, so first-arrival toolout re-emitted
+  full historical results and busted the provider prefix cache mid-session (Anthropic and
+  Responses `function_call_output`). Prefix hashing now strips `cache_control` (including nested
+  content blocks) so identity is semantic history only; real content edits still invalidate.
+  (#256)
+
 ## [0.12.4] - 2026-08-05
 
 ### Fixed
