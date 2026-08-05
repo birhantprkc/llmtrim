@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-08-05
+
 ### Fixed
 
 - **Memo ignores moving `cache_control` markers when matching original prefixes.** Claude Code
@@ -1586,7 +1588,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.4...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.5...HEAD
+[0.12.5]: https://github.com/fkiene/llmtrim/compare/v0.12.4...v0.12.5
 [0.12.4]: https://github.com/fkiene/llmtrim/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/fkiene/llmtrim/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/fkiene/llmtrim/compare/v0.12.1...v0.12.2
