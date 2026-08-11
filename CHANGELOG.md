@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Direct upstream TLS honours enterprise roots installed in the Windows certificate store.**
+  The MITM outbound connector used Mozilla's public WebPKI roots even on Windows, so HTTPS
+  inspection certificates trusted by the OS failed with `invalid peer certificate:
+  UnknownIssuer` and surfaced to Claude Code as a retryable `529`. The Windows direct path now
+  keeps rustls certificate verification while loading native roots; other platforms and the
+  explicit upstream-proxy path are unchanged.
+
 ## [0.12.5] - 2026-08-05
 
 ### Fixed

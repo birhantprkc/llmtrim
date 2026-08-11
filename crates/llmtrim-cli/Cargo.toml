@@ -139,6 +139,15 @@ auto-launch = "0.6.0"
 nix = { version = "0.31", features = ["user"] }
 
 [target.'cfg(windows)'.dependencies]
+# Corporate TLS interception roots are commonly installed only in the Windows certificate
+# store. The direct MITM upstream keeps rustls verification but loads native Windows roots;
+# resolver v3 keeps this target-only dependency out of non-Windows builds.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "aws-lc-rs",
+  "http1",
+  "http2",
+], optional = true }
+schannel = { version = "0.1.29", optional = true }
 winreg = "0.56"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }
 
@@ -159,7 +168,9 @@ intercept = [
   "dep:llm_providers",
   "dep:time",
   "dep:hyper-http-proxy",
+  "dep:hyper-rustls",
   "dep:hyper-util",
+  "dep:schannel",
   "dep:uuid",
   "dep:zstd",
   "dep:flate2",

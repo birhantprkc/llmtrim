@@ -1473,6 +1473,69 @@ mod imp {
         client
     }
 
+    /// Read Windows roots directly instead of going through `rustls-native-certs`, whose
+    /// `SSL_CERT_FILE`/`SSL_CERT_DIR` precedence can hide the OS store in an inherited shell.
+    #[cfg(windows)]
+    fn windows_root_store() -> Result<hudsucker::rustls::RootCertStore> {
+        use schannel::cert_context::ValidUses;
+        use schannel::cert_store::CertStore;
+
+        const PKIX_SERVER_AUTH: &str = "1.3.6.1.5.5.7.3.1";
+
+        let mut stores = vec![
+            CertStore::open_current_user("ROOT")
+                .context("failed to open current-user Windows root store")?,
+        ];
+        // Reading the machine store can require elevation under some enterprise policies.
+        // CurrentUser\Root already includes roots distributed to the user; augment it with the
+        // machine store when readable, but never require elevation merely to start the proxy.
+        if let Ok(machine_store) = CertStore::open_local_machine("ROOT") {
+            stores.push(machine_store);
+        }
+        let mut certificates = Vec::new();
+
+        for store in stores {
+            for certificate in store.certs() {
+                let valid_for_server_auth = match certificate.valid_uses() {
+                    Ok(ValidUses::All) => true,
+                    Ok(ValidUses::Oids(oids)) => oids.iter().any(|oid| oid == PKIX_SERVER_AUTH),
+                    Err(_) => false,
+                };
+                if valid_for_server_auth && certificate.is_time_valid().unwrap_or(false) {
+                    certificates.push(CertificateDer::from(certificate.to_der().to_vec()));
+                }
+            }
+        }
+
+        let mut roots = hudsucker::rustls::RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(certificates);
+        anyhow::ensure!(
+            added > 0,
+            "Windows root stores contained no usable TLS roots"
+        );
+        Ok(roots)
+    }
+
+    /// Build the direct Windows upstream connector with verified rustls transport, seeded from
+    /// the Windows stores instead of Mozilla's public-only roots or environment-selected bundles.
+    #[cfg(windows)]
+    fn windows_native_roots_connector() -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
+        let tls_config = hudsucker::rustls::ClientConfig::builder_with_provider(Arc::new(
+            aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("failed to configure Windows upstream TLS protocol versions")?
+        .with_root_certificates(windows_root_store()?)
+        .with_no_client_auth();
+
+        Ok(hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build())
+    }
+
     /// Per-source attribution attached to a `Pending` for the breakdown view: the parsed
     /// content blocks of the forwarded request, the inferred identity, and the model's
     /// context window. `None` on bodies we couldn't attribute (still proxied normally).
@@ -5407,8 +5470,9 @@ mod imp {
 
         // When LLMTRIM_UPSTREAM_PROXY is set, wrap hudsucker's outbound connector in a
         // hyper-http-proxy ProxyConnector that tunnels origin TLS connections via CONNECT
-        // through the upstream proxy. When the var is unset, fall back to the standard
-        // `.with_rustls_connector(...)` path — byte-identical behaviour to before this change.
+        // through the upstream proxy. When the var is unset, Windows keeps rustls verification
+        // but loads roots from the native certificate store (for example, enterprise TLS
+        // inspection CAs). Other platforms keep the existing rustls/WebPKI path.
         //
         // The two branches produce different generic Proxy<C, ...> types (rustls connector vs
         // proxy connector), so each branch calls .start().await directly rather than binding
@@ -5455,6 +5519,27 @@ mod imp {
                 .await
                 .map_err(|e| anyhow::anyhow!("proxy error: {e}"))?;
         } else {
+            #[cfg(windows)]
+            {
+                let native_roots_connector = windows_native_roots_connector()?;
+
+                Proxy::builder()
+                    .with_addr(addr)
+                    .with_ca(ca)
+                    .with_http_connector(native_roots_connector)
+                    .with_client(outbound_client_builder())
+                    .with_http_handler(handler)
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build proxy: {e}"))?
+                    .start()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("proxy error: {e}"))?;
+            }
+
+            #[cfg(not(windows))]
             Proxy::builder()
                 .with_addr(addr)
                 .with_ca(ca)
@@ -8527,6 +8612,13 @@ mod imp {
                 rx.try_recv().is_err(),
                 "exactly one ledger record for an empty body"
             );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn direct_windows_connector_loads_windows_store_roots() {
+            windows_native_roots_connector()
+                .expect("direct Windows upstream connector must load native roots");
         }
 
         // --- C1 regression: origin TLS is verified through the CONNECT tunnel ---
