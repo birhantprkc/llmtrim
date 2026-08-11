@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-08-11
+
 ### Fixed
 
 - **Memo drops stale `cache_control` on replay.** After #256 stripped markers from prefix
@@ -1604,7 +1606,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.5...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.6...HEAD
+[0.12.6]: https://github.com/fkiene/llmtrim/compare/v0.12.5...v0.12.6
 [0.12.5]: https://github.com/fkiene/llmtrim/compare/v0.12.4...v0.12.5
 [0.12.4]: https://github.com/fkiene/llmtrim/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/fkiene/llmtrim/compare/v0.12.2...v0.12.3
