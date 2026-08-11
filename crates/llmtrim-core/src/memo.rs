@@ -259,10 +259,15 @@ fn strip_ephemeral_fields(v: &Value) -> Value {
     }
 }
 
-/// Reuse stored semantic content while keeping request-local provider directives at their
-/// current locations. Claude Code moves `cache_control` between turns, so replaying a stored
-/// marker can leave both the old and new locations active and exceed Anthropic's four-marker
-/// limit. The current request remains the sole source of those ephemeral fields.
+/// Replay stored semantic content, then copy `cache_control` from `current`.
+///
+/// Claude Code moves Anthropic breakpoints between turns. Memo used to restore the whole
+/// first-forward item, so a rolled marker stayed on an old block while the client also set a
+/// new one, and Anthropic rejected the request (`Found 5` over a max of 4). Strip stored
+/// markers first; only the current request may reintroduce them.
+///
+/// `current` is walked by key/index against `stored`. If compression changed array length or
+/// object shape under a frozen item, a marker on a path that no longer exists is dropped.
 fn replay_with_current_ephemeral_fields(stored: &Value, current: &Value) -> Value {
     fn copy_ephemeral_fields(current: &Value, replayed: &mut Value) {
         match (current, replayed) {
@@ -392,13 +397,13 @@ fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan>
 /// JSON and the pipeline's **compressed** output JSON, this:
 ///
 /// 1. finds the longest original-message prefix already in `memo`,
-/// 2. overwrites those conversation slots in `compressed` with the stored (last-turn) semantic
-///    content while preserving the current request's ephemeral provider directives,
+/// 2. overwrites those conversation slots in `compressed` with the stored (last-turn)
+///    semantic content, then overlays this request's `cache_control` markers,
 /// 3. records this turn's `(prefix_hash -> compressed item)` for every conversation message,
 ///    so next turn can freeze one further.
 ///
-/// Returns the number of prefix messages whose content was reused verbatim (0 = nothing
-/// reused, i.e. behavior identical to no memo). Pure and synchronous; never panics; on any
+/// Returns how many prefix messages had their semantic content reused (0 = nothing reused,
+/// i.e. behavior identical to no memo). Pure and synchronous; never panics; on any
 /// structural surprise it makes no change and returns 0 (full stateless fallback).
 pub fn apply(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value) -> usize {
     let reused = replay(memo, salt, original, compressed);
@@ -431,10 +436,9 @@ pub fn replay(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value
     {
         for (idx, stored) in reused {
             if let Some(slot) = comp_msgs.get_mut(idx + plan.offset) {
-                // Replace the whole item so tool-result `output`, function-call `arguments`,
-                // and chat `content` all stay byte-identical to the prior turn. Request-local
-                // cache markers must remain at their current positions rather than replaying an
-                // old position alongside the new one.
+                // Freeze tool-result `output`, function-call `arguments`, and chat `content`
+                // from the stored item. Take `cache_control` from this request only: replaying
+                // a stale marker next to the client's new one exceeds Anthropic's max of 4.
                 let current = current_items.get(idx).unwrap_or(slot);
                 *slot = replay_with_current_ephemeral_fields(&stored, current);
             }

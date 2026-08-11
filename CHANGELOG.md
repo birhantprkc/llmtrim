@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Memo drops stale `cache_control` on replay.** After #256 stripped markers from prefix
+  hashes, memo still stored and replayed whole items including the old Anthropic breakpoint.
+  Claude Code already spends the four-marker budget (three stable on system/tools, one rolling
+  in history); replaying the previous rolling marker next to the new one made Anthropic reject
+  the request with `Found 5`. Replay now keeps stored semantic content and takes
+  `cache_control` only from the current request (messages and envelope). (#258)
+
 - **Direct upstream TLS honours enterprise roots installed in the Windows certificate store.**
   The MITM outbound connector used Mozilla's public WebPKI roots even on Windows, so HTTPS
   inspection certificates trusted by the OS failed with `invalid peer certificate:
