@@ -1,4 +1,4 @@
-//! Turn-stable compression memo — byte-identical frozen prefix across agent turns.
+//! Turn-stable compression memo: freeze prior-turn semantic content across agent turns.
 //!
 //! ## The problem this solves
 //!
@@ -17,8 +17,9 @@
 //!
 //! FlowKV (arXiv:2505.15347) and EpiCache (2025) formalize the fix: **freeze the past turns,
 //! process only the new ones.** This memo is that idea at the request-rewrite layer — it does
-//! not change any stage; it makes the *output* of a stage over an already-seen message prefix
-//! reproducible byte-for-byte by remembering what we emitted last turn and reusing it verbatim.
+//! not change any stage; it freezes the *semantic* output of a stage over an already-seen
+//! message prefix by reusing what we emitted last turn. Request-local `cache_control` markers
+//! come from the current request so a moved Anthropic breakpoint is not replayed next to the new one.
 //!
 //! ## How it works (design)
 //!
@@ -37,10 +38,10 @@
 //! - **Reuse.** On a new request, walk the original messages front-to-back; the longest run
 //!   `0..=m` whose every boundary hash is present in the store is the *frozen prefix*. We still
 //!   run the normal full-request pipeline (so all legend/injection/Stage-A logic stays exactly
-//!   correct), then overwrite the frozen-prefix slots in the compressed output with the stored
-//!   items — making them identical to last turn's output, which is what the provider cache keys
-//!   on. Only the *suffix* (new messages) carries this turn's fresh content compression; the
-//!   input-token gate still governs whatever was freshly compressed.
+//!   correct), then overwrite the frozen-prefix slots with the stored semantic items and overlay
+//!   this request's `cache_control`. Semantic content stays stable for the provider cache; markers
+//!   follow the client. Only the *suffix* (new messages) carries this turn's fresh compression;
+//!   the input-token gate still governs whatever was freshly compressed.
 //! - **Record.** After rewriting, store this request's `(prefix_hash[k] -> compressed item)`
 //!   for every conversation message **that is not already memoized** (first-write-wins), so
 //!   the next turn can freeze one message further without ever remutating a prior freeze.
@@ -50,8 +51,8 @@
 //! Most content stages compress each message *self-containedly* (retrieve prunes sentences,
 //! dedup folds duplicate lines, hygiene/serialize reshape a message's own JSON, toolout windows
 //! a message's own log) and any legend they inject is **static** text (the TOON `FORMAT_LEGEND`
-//! is a build-time constant) — so reusing an earlier message's compressed bytes verbatim is
-//! always sound.
+//! is a build-time constant) so reusing an earlier message's compressed semantic content is
+//! always sound (`cache_control` still comes from the current request).
 //!
 //! The **n-gram** stage is the exception: it rewrites content with placeholders (`§1`, `§2`, …)
 //! whose assignment depends on phrase frequencies across the *whole* conversation, and injects a
@@ -259,6 +260,47 @@ fn strip_ephemeral_fields(v: &Value) -> Value {
     }
 }
 
+/// Replay stored semantic content, then copy `cache_control` from `current`.
+///
+/// Claude Code moves Anthropic breakpoints between turns. Memo used to restore the whole
+/// first-forward item, so a rolled marker stayed on an old block while the client also set a
+/// new one, and Anthropic rejected the request (`Found 5` over a max of 4). Strip stored
+/// markers first; only the current request may reintroduce them.
+///
+/// `current` is walked by key/index against `stored`. If compression changed array length or
+/// object shape under a frozen item, a marker on a path that no longer exists is dropped.
+fn replay_with_current_ephemeral_fields(stored: &Value, current: &Value) -> Value {
+    fn copy_ephemeral_fields(current: &Value, replayed: &mut Value) {
+        match (current, replayed) {
+            (Value::Object(current_map), Value::Object(replayed_map)) => {
+                if let Some(cache_control) = current_map.get("cache_control") {
+                    replayed_map.insert("cache_control".into(), cache_control.clone());
+                }
+                for (key, current_value) in current_map {
+                    if key == "cache_control" {
+                        continue;
+                    }
+                    if let Some(replayed_value) = replayed_map.get_mut(key) {
+                        copy_ephemeral_fields(current_value, replayed_value);
+                    }
+                }
+            }
+            (Value::Array(current_values), Value::Array(replayed_values)) => {
+                for (current_value, replayed_value) in
+                    current_values.iter().zip(replayed_values.iter_mut())
+                {
+                    copy_ephemeral_fields(current_value, replayed_value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut replayed = strip_ephemeral_fields(stored);
+    copy_ephemeral_fields(current, &mut replayed);
+    replayed
+}
+
 /// The conversation array (`messages` / `input` / `contents`) and the key under which it lives,
 /// or `None` for a shape with no recognizable turn array (→ no memo, full stateless path).
 fn conversation(req: &Value) -> Option<(&'static str, &Vec<Value>)> {
@@ -271,12 +313,12 @@ fn conversation(req: &Value) -> Option<(&'static str, &Vec<Value>)> {
 }
 
 /// Per-message compressed conversation item, keyed by original-prefix fingerprint, harvested
-/// from a freshly compressed request so it can be replayed verbatim next turn. Pairs each entry
-/// with the original message index it came from, so the caller can both store it and (on the
-/// reuse path) overwrite the matching slot. Items are stored whole so Responses
+/// from a freshly compressed request so semantic content can be frozen next turn. Pairs each
+/// entry with the original message index it came from, so the caller can both store it and (on
+/// the reuse path) overwrite the matching slot. Items are stored whole so Responses
 /// `function_call_output.output` / `function_call.arguments` freeze the same way chat
-/// `message.content` does — a `content`-only memo silently dropped the OMP/Grok agent path.
-struct PrefixPlan {
+/// `message.content` does; a `content`-only memo silently dropped the OMP/Grok agent path.
+struct PrefixPlan<'a> {
     /// `(original_index, prefix_hash, compressed_item)` for every conversation message.
     entries: Vec<(usize, PrefixHash, Value)>,
     /// Index offset from original messages to compressed-output messages: `1` when a leading
@@ -289,12 +331,15 @@ struct PrefixPlan {
     /// identity so a freeze restores them with the prefix; without this, output-control
     /// appends mid-session and busts the provider cache at byte 0 even when history is frozen.
     envelope_key: Option<PrefixHash>,
+    /// Original conversation messages (same indices as `entries`). Replay overlays this
+    /// request's `cache_control` onto stored semantic content from these values.
+    original_msgs: &'a [Value],
 }
 
 /// Build the [`PrefixPlan`] linking each original message to the compressed item at its
 /// aligned slot. Returns `None` (→ fallback) if either side lacks a conversation array or the
 /// arrays don't align by a 0/1 leading-system offset.
-fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan> {
+fn plan<'a>(salt: &[u8], original: &'a Value, compressed: &Value) -> Option<PrefixPlan<'a>> {
     let (_, orig_msgs) = conversation(original)?;
     let (key, comp_msgs) = conversation(compressed)?;
 
@@ -349,6 +394,7 @@ fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan>
         offset,
         key,
         envelope_key,
+        original_msgs: orig_msgs.as_slice(),
     })
 }
 
@@ -356,13 +402,13 @@ fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan>
 /// JSON and the pipeline's **compressed** output JSON, this:
 ///
 /// 1. finds the longest original-message prefix already in `memo`,
-/// 2. overwrites those conversation slots in `compressed` with the stored (last-turn) items —
-///    making the frozen prefix byte-identical to last turn's output (provider cache hit),
+/// 2. overwrites those conversation slots in `compressed` with the stored (last-turn)
+///    semantic content, then overlays this request's `cache_control` markers,
 /// 3. records this turn's `(prefix_hash -> compressed item)` for every conversation message,
 ///    so next turn can freeze one further.
 ///
-/// Returns the number of prefix messages whose content was reused verbatim (0 = nothing
-/// reused, i.e. behavior identical to no memo). Pure and synchronous; never panics; on any
+/// Returns how many prefix messages had their semantic content reused (0 = nothing reused,
+/// i.e. behavior identical to no memo). Pure and synchronous; never panics; on any
 /// structural surprise it makes no change and returns 0 (full stateless fallback).
 pub fn apply(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value) -> usize {
     let reused = replay(memo, salt, original, compressed);
@@ -392,9 +438,11 @@ pub fn replay(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value
     {
         for (idx, stored) in reused {
             if let Some(slot) = comp_msgs.get_mut(idx + plan.offset) {
-                // Replace the whole item so tool-result `output`, function-call `arguments`,
-                // and chat `content` all stay byte-identical to the prior turn.
-                *slot = stored;
+                // Freeze tool-result `output`, function-call `arguments`, and chat `content`
+                // from the stored item. Take `cache_control` from this request only: replaying
+                // a stale marker next to the client's new one exceeds Anthropic's max of 4.
+                let current = plan.original_msgs.get(idx).unwrap_or(slot);
+                *slot = replay_with_current_ephemeral_fields(&stored, current);
             }
         }
         // Restore sticky envelope (instructions/tools/system) from the first forward of
@@ -407,7 +455,12 @@ pub fn replay(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value
             && let Some(root) = compressed.as_object_mut()
         {
             for (k, v) in obj {
-                root.insert(k.clone(), v.clone());
+                let current = original.get(k).or_else(|| root.get(k)).cloned();
+                let replayed = current
+                    .as_ref()
+                    .map(|current| replay_with_current_ephemeral_fields(v, current))
+                    .unwrap_or_else(|| strip_ephemeral_fields(v));
+                root.insert(k.clone(), replayed);
             }
         }
     }
@@ -1470,8 +1523,15 @@ mod tests {
             "prefix through multi-tool_result message must freeze despite cache_control move, got {reused}"
         );
         assert_eq!(
-            cb["messages"][2], frozen_multi,
-            "multi-tool_result user message must be byte-identical to first forward"
+            strip_ephemeral_fields(&cb["messages"][2]),
+            strip_ephemeral_fields(&frozen_multi),
+            "multi-tool_result content must be byte-identical to first forward"
+        );
+        assert!(
+            cb["messages"][2]["content"][3]
+                .get("cache_control")
+                .is_none(),
+            "the old cache breakpoint must not be replayed"
         );
         assert_eq!(
             cb["messages"][2]["content"][0]["content"].as_str().unwrap(),
@@ -1481,7 +1541,8 @@ mod tests {
         // Sibling tool_results in the same user message freeze together.
         for i in 0..4 {
             assert_eq!(
-                cb["messages"][2]["content"][i], frozen_multi["content"][i],
+                strip_ephemeral_fields(&cb["messages"][2]["content"][i]),
+                strip_ephemeral_fields(&frozen_multi["content"][i]),
                 "tool_result block {i} must freeze with the multi-tool message"
             );
         }
@@ -1547,6 +1608,104 @@ mod tests {
         assert_eq!(
             cbr["input"][2], frozen_fco,
             "Responses function_call_output must stay frozen across turns"
+        );
+    }
+
+    /// Claude Code already uses Anthropic's four-breakpoint allowance: three stable markers on
+    /// the prompt envelope and one rolling marker in message history. When the rolling marker
+    /// moves, replay must not retain its old location and create a fifth provider breakpoint.
+    #[test]
+    fn moving_cache_control_preserves_current_breakpoint_count() {
+        fn count_cache_control(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => {
+                    usize::from(map.contains_key("cache_control"))
+                        + map.values().map(count_cache_control).sum::<usize>()
+                }
+                Value::Array(values) => values.iter().map(count_cache_control).sum(),
+                _ => 0,
+            }
+        }
+
+        let memo = Memo::with_capacity(DEFAULT_CAPACITY);
+        let salt = test_salt("moving-cache-control-count");
+        let envelope = || {
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "stable instructions",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "tools": [
+                    {
+                        "name": "read",
+                        "description": "read a file",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "name": "bash",
+                        "description": "run a command",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+            })
+        };
+
+        let mut first = envelope();
+        first["messages"] = json!([
+            {"role": "user", "content": "inspect"},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "first result",
+                "cache_control": {"type": "ephemeral"}
+            }]}
+        ]);
+        assert_eq!(count_cache_control(&first), 4);
+        let mut forwarded_first = first.clone();
+        assert_eq!(apply(&memo, &salt, &first, &mut forwarded_first), 0);
+
+        let mut second = envelope();
+        second["messages"] = json!([
+            {"role": "user", "content": "inspect"},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "first result"
+            }]},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "call-2",
+                "name": "bash",
+                "input": {"command": "echo next"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-2",
+                "content": "next result",
+                "cache_control": {"type": "ephemeral"}
+            }]}
+        ]);
+        assert_eq!(count_cache_control(&second), 4, "client request is valid");
+
+        let mut forwarded_second = second.clone();
+        assert_eq!(apply(&memo, &salt, &second, &mut forwarded_second), 2);
+        assert!(
+            forwarded_second["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "memo replay must remove the stale breakpoint location"
+        );
+        assert!(
+            forwarded_second["messages"][3]["content"][0]
+                .get("cache_control")
+                .is_some(),
+            "memo replay must retain the current breakpoint location"
+        );
+        assert_eq!(
+            count_cache_control(&forwarded_second),
+            4,
+            "memo replay must preserve the client's current cache breakpoints"
         );
     }
 
