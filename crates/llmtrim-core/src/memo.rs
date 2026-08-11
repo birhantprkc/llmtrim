@@ -1,4 +1,4 @@
-//! Turn-stable compression memo — byte-identical frozen prefix across agent turns.
+//! Turn-stable compression memo: freeze prior-turn semantic content across agent turns.
 //!
 //! ## The problem this solves
 //!
@@ -17,8 +17,9 @@
 //!
 //! FlowKV (arXiv:2505.15347) and EpiCache (2025) formalize the fix: **freeze the past turns,
 //! process only the new ones.** This memo is that idea at the request-rewrite layer — it does
-//! not change any stage; it makes the *output* of a stage over an already-seen message prefix
-//! reproducible byte-for-byte by remembering what we emitted last turn and reusing it verbatim.
+//! not change any stage; it freezes the *semantic* output of a stage over an already-seen
+//! message prefix by reusing what we emitted last turn. Request-local `cache_control` markers
+//! come from the current request so a moved Anthropic breakpoint is not replayed next to the new one.
 //!
 //! ## How it works (design)
 //!
@@ -37,10 +38,10 @@
 //! - **Reuse.** On a new request, walk the original messages front-to-back; the longest run
 //!   `0..=m` whose every boundary hash is present in the store is the *frozen prefix*. We still
 //!   run the normal full-request pipeline (so all legend/injection/Stage-A logic stays exactly
-//!   correct), then overwrite the frozen-prefix slots in the compressed output with the stored
-//!   items — making them identical to last turn's output, which is what the provider cache keys
-//!   on. Only the *suffix* (new messages) carries this turn's fresh content compression; the
-//!   input-token gate still governs whatever was freshly compressed.
+//!   correct), then overwrite the frozen-prefix slots with the stored semantic items and overlay
+//!   this request's `cache_control`. Semantic content stays stable for the provider cache; markers
+//!   follow the client. Only the *suffix* (new messages) carries this turn's fresh compression;
+//!   the input-token gate still governs whatever was freshly compressed.
 //! - **Record.** After rewriting, store this request's `(prefix_hash[k] -> compressed item)`
 //!   for every conversation message **that is not already memoized** (first-write-wins), so
 //!   the next turn can freeze one message further without ever remutating a prior freeze.
@@ -50,8 +51,8 @@
 //! Most content stages compress each message *self-containedly* (retrieve prunes sentences,
 //! dedup folds duplicate lines, hygiene/serialize reshape a message's own JSON, toolout windows
 //! a message's own log) and any legend they inject is **static** text (the TOON `FORMAT_LEGEND`
-//! is a build-time constant) — so reusing an earlier message's compressed bytes verbatim is
-//! always sound.
+//! is a build-time constant) so reusing an earlier message's compressed semantic content is
+//! always sound (`cache_control` still comes from the current request).
 //!
 //! The **n-gram** stage is the exception: it rewrites content with placeholders (`§1`, `§2`, …)
 //! whose assignment depends on phrase frequencies across the *whole* conversation, and injects a
@@ -312,12 +313,12 @@ fn conversation(req: &Value) -> Option<(&'static str, &Vec<Value>)> {
 }
 
 /// Per-message compressed conversation item, keyed by original-prefix fingerprint, harvested
-/// from a freshly compressed request so it can be replayed verbatim next turn. Pairs each entry
-/// with the original message index it came from, so the caller can both store it and (on the
-/// reuse path) overwrite the matching slot. Items are stored whole so Responses
+/// from a freshly compressed request so semantic content can be frozen next turn. Pairs each
+/// entry with the original message index it came from, so the caller can both store it and (on
+/// the reuse path) overwrite the matching slot. Items are stored whole so Responses
 /// `function_call_output.output` / `function_call.arguments` freeze the same way chat
-/// `message.content` does — a `content`-only memo silently dropped the OMP/Grok agent path.
-struct PrefixPlan {
+/// `message.content` does; a `content`-only memo silently dropped the OMP/Grok agent path.
+struct PrefixPlan<'a> {
     /// `(original_index, prefix_hash, compressed_item)` for every conversation message.
     entries: Vec<(usize, PrefixHash, Value)>,
     /// Index offset from original messages to compressed-output messages: `1` when a leading
@@ -330,12 +331,15 @@ struct PrefixPlan {
     /// identity so a freeze restores them with the prefix; without this, output-control
     /// appends mid-session and busts the provider cache at byte 0 even when history is frozen.
     envelope_key: Option<PrefixHash>,
+    /// Original conversation messages (same indices as `entries`). Replay overlays this
+    /// request's `cache_control` onto stored semantic content from these values.
+    original_msgs: &'a [Value],
 }
 
 /// Build the [`PrefixPlan`] linking each original message to the compressed item at its
 /// aligned slot. Returns `None` (→ fallback) if either side lacks a conversation array or the
 /// arrays don't align by a 0/1 leading-system offset.
-fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan> {
+fn plan<'a>(salt: &[u8], original: &'a Value, compressed: &Value) -> Option<PrefixPlan<'a>> {
     let (_, orig_msgs) = conversation(original)?;
     let (key, comp_msgs) = conversation(compressed)?;
 
@@ -390,6 +394,7 @@ fn plan(salt: &[u8], original: &Value, compressed: &Value) -> Option<PrefixPlan>
         offset,
         key,
         envelope_key,
+        original_msgs: orig_msgs.as_slice(),
     })
 }
 
@@ -420,9 +425,6 @@ pub fn replay(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value
     let Some(plan) = plan(salt, original, compressed) else {
         return 0;
     };
-    let Some((_, current_items)) = conversation(original) else {
-        return 0;
-    };
     let mut reused: Vec<(usize, Value)> = Vec::new();
     for (idx, h, _) in &plan.entries {
         match memo.get(*h) {
@@ -439,7 +441,7 @@ pub fn replay(memo: &Memo, salt: &[u8], original: &Value, compressed: &mut Value
                 // Freeze tool-result `output`, function-call `arguments`, and chat `content`
                 // from the stored item. Take `cache_control` from this request only: replaying
                 // a stale marker next to the client's new one exceeds Anthropic's max of 4.
-                let current = current_items.get(idx).unwrap_or(slot);
+                let current = plan.original_msgs.get(idx).unwrap_or(slot);
                 *slot = replay_with_current_ephemeral_fields(&stored, current);
             }
         }
