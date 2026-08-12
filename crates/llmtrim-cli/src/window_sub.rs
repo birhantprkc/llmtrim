@@ -66,7 +66,23 @@ fn valid(value: &str) -> bool {
         && !value.contains("..")
 }
 fn valid_provider(value: &str) -> bool {
-    matches!(value, "codex" | "kimi" | "grok")
+    matches!(
+        value,
+        "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" | "codex" | "kimi" | "grok"
+    ) || valid_model_id(value)
+}
+
+/// A CLIProxyAPI model id that `/sub on <id>` may pin for this window.
+pub fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+        && !value.contains("..")
+        && !value.eq_ignore_ascii_case("off")
+        && !value.eq_ignore_ascii_case("anthropic")
+        && (value.contains('-') || value.contains('/') || value.contains('.'))
 }
 
 pub fn registry_path() -> Result<PathBuf> {

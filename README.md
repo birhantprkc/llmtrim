@@ -308,19 +308,20 @@ The redirect only fires once the prompt cache has gone cold. `/compact` re-sends
 <details>
 <summary><b>Subscription reroute (`sub`)</b> (opt-in; may conflict with provider ToS)</summary>
 
-Serve Claude Code from a ChatGPT/Codex, Kimi, or SuperGrok plan instead of Anthropic, or as fallback when Anthropic fails. Login prints a warning; decide for yourself.
+Send Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) instead of Anthropic, or as fallback when Anthropic fails. Login is CLIProxyAPI's own TUI; decide for yourself whether that fits the provider ToS.
 
 ```bash
-llmtrim sub auth codex login    # or kimi / grok
-llmtrim sub on codex            # or kimi / grok
+llmtrim sub on                  # install + start CLIProxyAPI, enable redirect
+llmtrim sub auth                # CLIProxyAPI TUI — sign in to Codex / Claude / Gemini / Grok / …
+llmtrim sub models              # models the sidecar can serve
 llmtrim sub status
 llmtrim sub mode fallback       # only when Anthropic fails
-llmtrim sub chain codex,kimi,grok
 llmtrim sub off
 ```
 
-Interactive: `llmtrim status` → tab **4 Sub** (or `llmtrim sub setup`) — cycle routing
-presets with ←/→, Enter to apply, `e` to edit the tier→model map.
+Interactive: `llmtrim status` → tab **4 Sub** — lists CLIProxyAPI models; Enter toggles reroute.
+`llmtrim update` also updates CLIProxyAPI when you use it. Point `LLMTRIM_CLIPROXY_URL` at an
+existing instance to skip the managed sidecar.
 
 Route only a delegated Claude Code subagent while leaving the parent window unchanged:
 
@@ -337,12 +338,14 @@ agent files and records an opt-out so `ensure` leaves them removed.
 This window only (installed with ensure; includes subagents; survives `/clear`):
 
 ```text
-/sub on [optional:codex|kimi|grok]   # bare /sub on = last window provider or global sub
+/sub on [optional:model-id]   # bare /sub on = CLIProxyAPI with Claude model ids passed through
 /sub off
 /sub status
 ```
 
-Tokens: `~/.llmtrim/<provider>/auth.json` (mode 0600). Env: `LLMTRIM_SUB`, `LLMTRIM_SUB_MODE`, `LLMTRIM_SUB_CHAIN`.
+Sidecar: `~/.llmtrim/cliproxy/` (binary + config). Auth: `~/.cli-proxy-api` when present, else
+`~/.llmtrim/cliproxy/auth`. Env: `LLMTRIM_SUB`, `LLMTRIM_SUB_MODE`, `LLMTRIM_CLIPROXY_URL`,
+`LLMTRIM_CLIPROXY_KEY`.
 
 **Anthropic `/login` vs claude.ai connectors:** with global `sub` in `always` mode, by
 default llmtrim writes a dummy `ANTHROPIC_AUTH_TOKEN` into `~/.claude/settings.json` (same

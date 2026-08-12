@@ -453,6 +453,8 @@ mod imp {
         /// acceptance it becomes the session's last-known-good snapshot for the context-limit
         /// guard; never recorded when the backend rejects before any output is exposed.
         anthropic_snapshot: Option<Value>,
+        /// CLIProxyAPI already speaks Anthropic SSE — skip first-party reducers.
+        passthrough: bool,
     }
 
     /// Enough of the rewritten upstream request to re-issue it on a retryable failure. The body is
@@ -1815,9 +1817,9 @@ mod imp {
         /// forwarded verbatim (still intercepted, just not compressed).
         exclude_hosts: Arc<Vec<String>>,
         exclude_providers: Arc<Vec<String>>,
-        /// Subscription reroute target (`sub = codex|kimi|grok`), snapshotted from [`RuntimeConfig`] at
-        /// construction. `None` = normal transparent compress-and-forward. When set, intercepted
-        /// Anthropic `/v1/messages` traffic is translated and sent to that subscription's backend.
+        /// Subscription reroute target (`sub = on` / CLIProxyAPI), snapshotted from [`RuntimeConfig`]
+        /// at construction. `None` = normal transparent compress-and-forward. When set, intercepted
+        /// Anthropic `/v1/messages` traffic is rewritten to the CLIProxyAPI sidecar.
         sub: Option<crate::reroute::SubProvider>,
         /// Ordered fallback providers. The active `sub` is used when this is empty.
         sub_chain: Arc<Vec<crate::reroute::SubProvider>>,
@@ -2062,9 +2064,19 @@ mod imp {
                         .get("x-claude-code-session-id")
                         .and_then(|v| v.to_str().ok()),
                 );
+                let window_model_pin: Option<String> = match &window_intent {
+                    Some(crate::window_sub::Intent::Enabled { provider })
+                        if crate::reroute::SubProvider::parse(provider).is_none()
+                            && crate::window_sub::valid_model_id(provider) =>
+                    {
+                        Some(provider.clone())
+                    }
+                    _ => None,
+                };
                 let window_sub = match &window_intent {
                     Some(crate::window_sub::Intent::Enabled { provider }) => {
                         crate::reroute::SubProvider::parse(provider)
+                            .or(Some(crate::reroute::SubProvider::CliProxy))
                     }
                     _ => None,
                 };
@@ -2089,7 +2101,7 @@ mod imp {
                             return self.reroute_count_tokens(req).await;
                         }
                         if req.method() == Method::POST && path_kind == AnthropicApiPath::Messages {
-                            return self.reroute_messages(req, sub, None).await;
+                            return self.reroute_messages(req, sub, window_model_pin).await;
                         }
                     }
                 } else if !window_disabled
@@ -2621,66 +2633,18 @@ mod imp {
                 };
             apply_sub_effort(&mut translate_value, self.sub_effort.as_deref());
 
-            // Fetch the subscription token (OAuth refresh is blocking + single-flight).
-            let token = match tokio::task::spawn_blocking(move || {
-                crate::reroute::auth::get_token(sub)
-            })
-            .await
+            if let Some(model) = explicit_model.as_deref() {
+                translate_value["model"] = serde_json::Value::String(model.to_string());
+            } else if let Some(logical) = compact_current
+                .as_ref()
+                .map(|c| c.logical_model.as_str())
             {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    return anthropic_error(
-                        401,
-                        &format!(
-                            "llmtrim: {p} not authenticated ({e}). Run `llmtrim sub auth {p} login`.",
-                            p = sub.as_str()
-                        ),
-                    )
-                    .into();
-                }
-                Err(_) => return anthropic_error(500, "llmtrim: auth task failed").into(),
-            };
-
-            // Refresh the Codex plan's rate-limit windows for the status line (throttled,
-            // fire-and-forget). Claude Code's stdin blob only carries Anthropic quotas.
-            if sub == crate::reroute::SubProvider::Codex {
-                crate::reroute::quota::maybe_schedule_codex_poll(
-                    token.access.clone(),
-                    token.account_id.clone(),
-                );
+                translate_value["model"] = serde_json::Value::String(logical.to_string());
             }
-
-            // Tiers must match the provider actually serving this turn. A window `/sub on grok`
-            // with global `sub = codex` must use `[sub.grok.tiers]` (or Grok defaults), not the
-            // Codex mapping snapshotted into `self.sub_tiers` at daemon start.
-            let tiers = llmtrim_core::config::sub_tiers_for(sub.as_str());
-            let rewrite_result = if let Some(model) = explicit_model.as_deref() {
-                crate::reroute::build_upstream_for_explicit_model(
-                    sub,
-                    &translate_value,
-                    model,
-                    &tiers,
-                    &token,
-                    session_id.as_deref(),
-                )
-            } else {
-                crate::reroute::build_upstream_for_model(
-                    sub,
-                    &translate_value,
-                    compact_current.as_ref().map(|c| c.logical_model.as_str()),
-                    &tiers,
-                    &token,
-                    session_id.as_deref(),
-                )
-            };
-            let rewrite = match rewrite_result {
+            let rewrite = match crate::reroute::cliproxy::rewrite(&translate_value) {
                 Ok(r) => r,
                 Err(e) => {
-                    return anthropic_error(
-                        502,
-                        &format!("llmtrim: reroute translation failed: {e}"),
-                    )
-                    .into();
+                    return anthropic_error(502, &format!("llmtrim: {e}")).into();
                 }
             };
 
@@ -2688,25 +2652,9 @@ mod imp {
             // `logical_body` is the full pre-delta codex request (used for recording the
             // transcript and for re-issuing on continuation errors). `sent_body` may be a
             // delta version. This matches the proxy's handling (except transport specifics).
-            let mut sent_body = rewrite.body.clone();
-            let mut logical_body: Option<Value> = None;
-            if sub == crate::reroute::SubProvider::Codex
-                && let Ok(mut bval) = serde_json::from_slice::<Value>(&rewrite.body)
-            {
-                logical_body = Some(bval.clone());
-                let enabled =
-                    llmtrim_core::config::RuntimeConfig::get().sub_codex_previous_response_id;
-                let cand = crate::reroute::continuation::continuation_candidate(
-                    session_id.as_deref(),
-                    &bval,
-                    enabled,
-                );
-                crate::reroute::continuation::apply_codex_continuation(&mut bval, &cand);
-                if let Ok(serialized) = serde_json::to_vec(&bval) {
-                    sent_body = serialized;
-                }
-            }
-            capture_reroute(&sent_body, session_id.as_deref(), sub.as_str());
+            let sent_body = rewrite.body.clone();
+            let logical_body: Option<Value> = None;
+            capture_reroute(&sent_body, session_id.as_deref(), "cliproxy");
 
             // Record intent: provider stays Anthropic (we emit Anthropic SSE, which `Finalize`
             // measures); model is the resolved upstream model; `reroute` marks the response path.
@@ -2726,22 +2674,23 @@ mod imp {
                 frozen_input_tokens: None,
                 breakdown,
                 reroute: Some(RerouteInfo {
-                    provider: sub,
+                    provider: crate::reroute::SubProvider::CliProxy,
                     model: rewrite.model.clone(),
                     client_model: client_model.clone(),
                     replay: Some(RerouteReplay {
-                        url: format!("https://{}{}", rewrite.host, rewrite.path),
+                        url: rewrite.url(),
                         headers: rewrite.headers.clone(),
                         body: Arc::new(sent_body.clone()),
                     }),
                     logical_body,
                     session_id: session_id.clone(),
                     anthropic_snapshot: Some(translate_value.clone()),
+                    passthrough: true,
                 }),
                 fallback: None,
                 compact: compact_current.map(|_| CompactAttempt {
                     candidates: compact_candidates,
-                    url: format!("https://{}{}", rewrite.host, rewrite.path),
+                    url: rewrite.url(),
                     headers: rewrite.headers.clone(),
                     original_body: Arc::new(bytes.to_vec()),
                     max_tokens,
@@ -2751,10 +2700,8 @@ mod imp {
                 }),
             });
 
-            // Retarget the request onto the provider host + path.
-            if let Ok(uri) =
-                format!("https://{}{}", rewrite.host, rewrite.path).parse::<hudsucker::hyper::Uri>()
-            {
+            // Retarget the request onto CLIProxyAPI (HTTP localhost).
+            if let Ok(uri) = rewrite.url().parse::<hudsucker::hyper::Uri>() {
                 parts.uri = uri;
             }
             // Strip the client's Anthropic auth + hop headers; hyper sets host/content-length.
@@ -3680,6 +3627,7 @@ mod imp {
                     logical_body: attempt.logical_body,
                     session_id: fb.session_id.clone(),
                     anthropic_snapshot: Some(anthropic.clone()),
+                    passthrough: attempt.provider == crate::reroute::SubProvider::CliProxy,
                 });
                 if let Some(info) = pending.reroute.as_ref()
                     && let Some(snap) = info.anthropic_snapshot.as_ref()
@@ -3760,7 +3708,7 @@ mod imp {
                     sent_body = serialized;
                 }
             }
-            let url = format!("https://{}{}", rewrite.host, rewrite.path);
+            let url = rewrite.url();
             let headers = rewrite.headers.clone();
             let body = String::from_utf8_lossy(&sent_body).into_owned();
             let proxy = self.upstream_proxy.clone();
@@ -3980,6 +3928,7 @@ mod imp {
                     logical_body: attempt.logical_body,
                     session_id: state.session_id.clone(),
                     anthropic_snapshot: Some(body),
+                    passthrough: provider == crate::reroute::SubProvider::CliProxy,
                 });
                 let info = winner.reroute.clone().expect("reroute set above");
                 return Some(self.finish_buffered_reroute(winner, &info, attempt.body));
@@ -4127,10 +4076,11 @@ mod imp {
                 );
                 return buffered_response(status, content_type, body);
             }
-            // Subscription reroute: the upstream reply is the provider's SSE — translate it back to
-            // Anthropic SSE (the normal compress/replay/tee path below is for verbatim-forwarded
-            // Anthropic responses).
-            if let Some(info) = pending.reroute.clone() {
+            // Subscription reroute: first-party translators need an SSE reducer. CLIProxyAPI
+            // already speaks Anthropic, so those turns fall through to the normal tee path.
+            if let Some(info) = pending.reroute.clone()
+                && !info.passthrough
+            {
                 return self.reroute_response(res, pending, info).await;
             }
             // Fallback reroute: Anthropic could not serve the turn. On a *transient* status
@@ -5405,7 +5355,7 @@ mod imp {
                     && let Some(r) = raw
                 {
                     eprintln!(
-                        "llmtrim: unknown sub provider '{r}' — reroute disabled (expected codex|kimi|grok)"
+                        "llmtrim: unknown sub provider '{r}' — reroute disabled (expected on|cliproxy)"
                     );
                 }
                 parsed
@@ -5420,7 +5370,7 @@ mod imp {
                             // Silently dropping it would leave a typo'd chain quietly shorter than
                             // the user configured — and the fallback they think they have missing.
                             eprintln!(
-                                "llmtrim: unknown provider '{p}' in the sub fallback chain — ignored (expected codex|kimi|grok)"
+                                "llmtrim: unknown provider '{p}' in the sub fallback chain — ignored (expected on|cliproxy)"
                             );
                         }
                         parsed
@@ -5456,6 +5406,11 @@ mod imp {
             crate::recall::serve(recall).await?;
         }
 
+        if handler.sub.is_some()
+            && let Err(e) = crate::reroute::cliproxy::ensure_running()
+        {
+            eprintln!("llmtrim: CLIProxyAPI sidecar: {e}");
+        }
         eprintln!("llmtrim: MITM interceptor on http://{addr}");
         eprintln!("  export HTTPS_PROXY=http://{addr}");
         eprintln!(

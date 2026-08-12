@@ -71,6 +71,7 @@ impl App {
                 .filter(|m| in_catalog(m) || m.starts_with("grok-"))
                 .cloned()
                 .unwrap_or_else(|| super::default_grok_tier_model(t).to_string()),
+            SubProvider::CliProxy => String::new(),
         });
         Self {
             provider,

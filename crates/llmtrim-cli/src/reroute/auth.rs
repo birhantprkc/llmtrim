@@ -96,6 +96,9 @@ pub fn get_token(provider: SubProvider) -> Result<TokenSet> {
                 account_id: None,
             })
         }
+        SubProvider::CliProxy => {
+            anyhow::bail!("CLIProxyAPI auth is `llmtrim sub auth` (sidecar TUI), not a stored token")
+        }
     }
 }
 
@@ -206,6 +209,7 @@ fn provider_lock(provider: SubProvider) -> &'static Mutex<()> {
         SubProvider::Codex => &CODEX_LOCK,
         SubProvider::Kimi => &KIMI_LOCK,
         SubProvider::Grok => &GROK_LOCK,
+        SubProvider::CliProxy => &CODEX_LOCK,
     }
 }
 
@@ -844,6 +848,7 @@ pub fn auth_status_json(provider: super::SubProvider) -> serde_json::Value {
         SubProvider::Codex => read_codex().ok().map(|s| (s.expires, s.account_id)),
         SubProvider::Kimi => read_kimi().ok().map(|s| (s.expires, None)),
         SubProvider::Grok => read_grok().ok().map(|s| (s.expires, None)),
+        SubProvider::CliProxy => None,
     };
     match stored {
         Some((expires, account_id)) => serde_json::json!({

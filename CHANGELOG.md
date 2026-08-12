@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **`sub` now uses CLIProxyAPI.** `llmtrim sub on` installs and starts
+  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), then rewrites intercepted
+  Anthropic traffic to it. `/sub on [model]` does the same for one Claude Code window.
+  `llmtrim status` tab 4 lists CLIProxyAPI models. `llmtrim update` also updates the
+  sidecar when you use it. First-party Codex/Kimi/Grok protocol translation is no longer
+  the live path. (`LLMTRIM_CLIPROXY_URL` / `LLMTRIM_CLIPROXY_KEY` point at an existing
+  instance instead of the managed sidecar.)
+
 - **Grok flagship is `grok-4.6`.** Default Grok tier preset maps Opus/Sonnet/Fable to
   `grok-4.6` (replacing `grok-4.5`); Haiku stays on `grok-composer-2.5-fast`. The subscription
   catalog no longer lists `grok-4.5`.

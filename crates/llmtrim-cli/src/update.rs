@@ -291,6 +291,14 @@ pub fn run() -> Result<()> {
         }
     }
     // Package-manager channels: the panel already ends with `llmtrim ensure`.
+    #[cfg(feature = "intercept")]
+    {
+        match crate::reroute::cliproxy::update_if_used() {
+            Ok(Some(msg)) => println!("{msg}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("llmtrim: CLIProxyAPI update skipped: {e:#}"),
+        }
+    }
     Ok(())
 }
 

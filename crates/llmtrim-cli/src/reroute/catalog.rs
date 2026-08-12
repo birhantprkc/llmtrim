@@ -41,6 +41,7 @@ pub fn models_for(provider: SubProvider) -> Vec<CatalogEntry> {
             .iter()
             .map(|id| entry_for(id, &["x-ai/", "xai/"]))
             .collect(),
+        SubProvider::CliProxy => Vec::new(),
     }
 }
 

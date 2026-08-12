@@ -926,9 +926,9 @@ pub struct RuntimeConfig {
     /// name (`mocha`/`macchiato`/`frappe`/`latte`). The `t` key persists the user's choice
     /// here via [`save_theme`]. The TUI validates the name and falls back to its default.
     pub theme: Option<String>,
-    /// Subscription reroute target (env `LLMTRIM_SUB` / file `sub`): `codex`, `kimi`, or `grok` reroutes
-    /// intercepted Anthropic `/v1/messages` traffic to that subscription's backend instead of
-    /// Anthropic (translating the request/response wire shapes). `off`/unset keeps the
+    /// Subscription reroute target (env `LLMTRIM_SUB` / file `sub`): `on` (or `cliproxy`)
+    /// rewrites intercepted Anthropic `/v1/messages` traffic to the managed CLIProxyAPI sidecar.
+    /// Legacy `codex`/`kimi`/`grok` values still enable the sidecar. `off`/unset keeps the
     /// transparent compress-and-forward behavior. Lowercased; an unknown value is left as-is
     /// for the serve layer to reject with a clear error.
     pub sub: Option<String>,

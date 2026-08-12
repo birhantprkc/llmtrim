@@ -1,19 +1,18 @@
-//! Subscription reroute: send intercepted Anthropic `/v1/messages` traffic to a *different*
-//! subscription's backend (ChatGPT/Codex, Kimi, or Grok) instead of Anthropic, translating the
-//! request and streamed response between wire shapes.
+//! Subscription reroute: send intercepted Anthropic `/v1/messages` traffic through
+//! [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) instead of Anthropic.
 //!
-//! This is opt-in (`sub = "codex"|"kimi"|"grok"` in the config, off by default) and rides the
-//! existing MITM path: [`crate::serve`] rewrites the intercepted request's URI authority to the
-//! provider host and swaps in the translated body + provider auth, so hudsucker forwards it over
-//! the same client and `handle_response` streams the translated reply back. Nothing here opens its
-//! own socket except the one-time OAuth flows in [`auth`].
+//! This is opt-in (`sub = "on"` in the config, off by default). [`crate::serve`] rewrites the
+//! intercepted request onto the managed CLIProxyAPI sidecar (Anthropic-shaped in and out).
+//! First-party Codex/Kimi/Grok translators remain for tests and legacy helpers; the live path
+//! does not use them.
 //!
 //! **Terms of service:** driving a ChatGPT/Kimi/Grok *subscription* through a non-official client
-//! is a gray area and can get that account restricted. Reroute is off by default and the
-//! `auth login` commands print this warning. Use at your own risk.
+//! is a gray area and can get that account restricted. Reroute is off by default. Use at your
+//! own risk.
 
 pub mod auth;
 pub mod catalog;
+pub mod cliproxy;
 pub mod codex;
 pub mod context_limit;
 pub mod continuation;
@@ -42,6 +41,15 @@ pub struct UpstreamRewrite {
     pub body: Vec<u8>,
     pub model: String,
     pub provider: SubProvider,
+    /// CLIProxyAPI is a local HTTP server. First-party translators speak HTTPS.
+    pub insecure_http: bool,
+}
+
+impl UpstreamRewrite {
+    pub fn url(&self) -> String {
+        let scheme = if self.insecure_http { "http" } else { "https" };
+        format!("{}://{}{}", scheme, self.host, self.path)
+    }
 }
 
 /// Translate an intercepted Anthropic `/v1/messages` body into a provider-targeted request, using
@@ -79,6 +87,7 @@ pub(crate) fn build_upstream_for_model(
 
 /// Build a request for a concrete model selected by a routed custom agent. Unlike compact/tier
 /// routing, this never substitutes another model behind the explicit selection.
+#[allow(dead_code)] // first-party translators; live path uses cliproxy::rewrite
 pub(crate) fn build_upstream_for_explicit_model(
     provider: SubProvider,
     anthropic_body: &Value,
@@ -148,6 +157,9 @@ fn build_upstream_with_model(
             let h = grok::request_headers(&token.access, token.account_id.as_deref(), session_id);
             (grok::HOST, grok::PATH, serde_json::to_vec(&b)?, h)
         }
+        SubProvider::CliProxy => {
+            return cliproxy::rewrite(anthropic_body);
+        }
     };
     Ok(UpstreamRewrite {
         host: host.to_string(),
@@ -156,6 +168,7 @@ fn build_upstream_with_model(
         body,
         model,
         provider,
+        insecure_http: false,
     })
 }
 
@@ -174,6 +187,7 @@ impl StreamReducer {
             SubProvider::Codex => StreamReducer::Codex(codex::Reducer::new(model)),
             SubProvider::Kimi => StreamReducer::Kimi(kimi::Reducer::new(model)),
             SubProvider::Grok => StreamReducer::Grok(grok::Reducer::new(model)),
+            SubProvider::CliProxy => StreamReducer::Kimi(kimi::Reducer::new(model)),
         }
     }
 
@@ -263,6 +277,8 @@ pub enum SubProvider {
     Codex,
     Kimi,
     Grok,
+    /// Managed CLIProxyAPI sidecar. The live `sub on` path.
+    CliProxy,
 }
 
 impl SubProvider {
@@ -270,6 +286,9 @@ impl SubProvider {
     /// unknown value once; unknown never silently reroutes).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" => {
+                Some(SubProvider::CliProxy)
+            }
             "codex" | "chatgpt" | "openai" => Some(SubProvider::Codex),
             "kimi" | "moonshot" => Some(SubProvider::Kimi),
             "grok" | "xai" | "x-ai" => Some(SubProvider::Grok),
@@ -282,6 +301,7 @@ impl SubProvider {
             SubProvider::Codex => "codex",
             SubProvider::Kimi => "kimi",
             SubProvider::Grok => "grok",
+            SubProvider::CliProxy => "on",
         }
     }
 }
@@ -401,6 +421,7 @@ pub fn resolve_model(
             SubProvider::Codex => default_codex_tier_model(tier).to_string(),
             SubProvider::Grok => default_grok_tier_model(tier).to_string(),
             SubProvider::Kimi => KIMI_MODEL.to_string(),
+            SubProvider::CliProxy => base,
         };
     }
     // 3. Not a Claude tier: pass through known provider ids; otherwise fall back to sonnet.
@@ -418,6 +439,7 @@ pub fn resolve_model(
             .cloned()
             .unwrap_or_else(|| default_grok_tier_model(Tier::Sonnet).to_string()),
         SubProvider::Kimi => KIMI_MODEL.to_string(),
+        SubProvider::CliProxy => base,
     }
 }
 
@@ -428,6 +450,7 @@ fn model_ok_for(provider: SubProvider, model: &str) -> bool {
         SubProvider::Codex => is_codex_model(model),
         SubProvider::Grok => is_grok_model(model),
         SubProvider::Kimi => model == KIMI_MODEL || model.starts_with("kimi"),
+        SubProvider::CliProxy => true,
     }
 }
 
@@ -609,6 +632,17 @@ mod tests {
             resolve_model(SubProvider::Grok, "grok-composer-2.5-fast", &ov),
             "grok-composer-2.5-fast"
         );
+    }
+
+    #[test]
+    fn parse_accepts_cliproxy_aliases() {
+        assert_eq!(SubProvider::parse("on"), Some(SubProvider::CliProxy));
+        assert_eq!(SubProvider::parse("cliproxy"), Some(SubProvider::CliProxy));
+        assert_eq!(
+            SubProvider::parse("CLI-Proxy-API"),
+            Some(SubProvider::CliProxy)
+        );
+        assert_eq!(SubProvider::CliProxy.as_str(), "on");
     }
 
     #[test]
