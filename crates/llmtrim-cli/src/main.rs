@@ -479,8 +479,8 @@ enum SubCmd {
     },
     /// Enable reroute through CLIProxyAPI (installs + starts the sidecar).
     ///
-    /// An optional model id pins every turn to that CLIProxyAPI model. `sub use` and
-    /// `sub start` are accepted aliases.
+    /// An optional CLIProxyAPI CLI (`gemini`, `codex`, …) or model id pins every turn.
+    /// `sub use` and `sub start` are accepted aliases.
     #[command(visible_alias = "use", alias = "start")]
     On {
         /// Optional CLIProxyAPI model id to pin. Omit to pass Claude model ids through.
@@ -803,26 +803,21 @@ fn read_stdin() -> Result<String> {
     Ok(buf)
 }
 
-/// Resolve which label a window `/sub on [model]` should store.
-/// Bare `/sub on` enables CLIProxyAPI for the window. An argument is a model pin
-/// (or a legacy provider alias, which just enables the sidecar).
+/// Resolve which label a window `/sub on [backend|model]` should store.
+/// Bare `/sub on` enables CLIProxyAPI. A CLIProxyAPI CLI name (`gemini`, `codex`, …)
+/// or a model id is pinned for this window.
 #[cfg(feature = "intercept")]
 fn window_sub_provider(requested: Option<&str>) -> Result<String> {
+    use llmtrim::reroute::cliproxy::{PinRequest, parse_pin_request, resolve_pin_live};
     match requested {
         None => Ok("on".into()),
-        Some(raw) => {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                return Ok("on".into());
-            }
-            if llmtrim::reroute::SubProvider::parse(raw).is_some() {
-                return Ok("on".into());
-            }
-            if llmtrim::window_sub::valid_model_id(raw) {
-                return Ok(raw.to_string());
-            }
-            bail!("usage: /sub on [model-id] | off | status");
-        }
+        Some(raw) => match parse_pin_request(raw) {
+            Some(PinRequest::Enable) => Ok("on".into()),
+            Some(PinRequest::Pin(pin)) => Ok(resolve_pin_live(&pin).unwrap_or(pin)),
+            None => bail!(
+                "usage: /sub on [codex|claude|gemini|grok|kimi|vertex|qwen|copilot|model-id] | off | status"
+            ),
+        },
     }
 }
 
@@ -930,7 +925,9 @@ fn run_window_sub(args: Vec<String>) -> Result<()> {
                     }
                     None => println!("This window follows the global subscription policy."),
                 },
-                _ => bail!("usage: /sub on [model-id] | off | status"),
+                _ => bail!(
+                    "usage: /sub on [codex|claude|gemini|grok|kimi|vertex|qwen|copilot|model-id] | off | status"
+                ),
             }
         }
         _ => bail!("unknown window-sub action"),
@@ -1229,13 +1226,28 @@ fn run_sub(action: SubCmd) -> Result<()> {
             println!("Installing/starting CLIProxyAPI…");
             llmtrim::reroute::cliproxy::ensure_running()?;
             llmtrim_core::config::enable_sub("on")?;
-            if let Some(model) = provider
+            match provider
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                && llmtrim::reroute::SubProvider::parse(model).is_none()
             {
-                println!("Pinned model: {model} (window `/sub on {model}` to pin one session).");
+                None => {
+                    llmtrim_core::config::write_sub_model(None)?;
+                }
+                Some(raw) => match llmtrim::reroute::cliproxy::parse_pin_request(raw) {
+                    Some(llmtrim::reroute::cliproxy::PinRequest::Enable) => {
+                        llmtrim_core::config::write_sub_model(None)?;
+                    }
+                    Some(llmtrim::reroute::cliproxy::PinRequest::Pin(pin)) => {
+                        let wire = llmtrim::reroute::cliproxy::resolve_pin_live(&pin)
+                            .unwrap_or_else(|| pin.clone());
+                        llmtrim_core::config::write_sub_model(Some(&wire))?;
+                        println!("Pinned: {wire}.");
+                    }
+                    None => anyhow::bail!(
+                        "unknown target '{raw}' (codex|claude|gemini|grok|kimi|vertex|qwen|copilot or a model id)"
+                    ),
+                },
             }
             println!(
                 "Reroute enabled via CLIProxyAPI at {}.",

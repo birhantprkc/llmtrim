@@ -1292,6 +1292,40 @@ fn resolve_sub_skip_anthropic_login(
         .unwrap_or(true) // default: skip Anthropic login while always-sub
 }
 
+/// Global CLIProxyAPI model pin (`sub.model` / `LLMTRIM_SUB_MODEL`). `None` = pass Claude ids
+/// through (or expand a backend alias at request time).
+pub fn sub_model() -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let file = load_config_file();
+    resolve_sub_model(&env, file.as_ref())
+}
+
+fn resolve_sub_model(
+    env: &impl Fn(&str) -> Option<String>,
+    file: Option<&toml::Value>,
+) -> Option<String> {
+    if let Some(v) = env("LLMTRIM_SUB_MODEL").filter(|s| !s.is_empty()) {
+        return Some(v.trim().to_string());
+    }
+    file.and_then(|v| v.get("sub"))
+        .and_then(|v| v.get("model"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Persist or clear the global CLIProxyAPI model pin.
+pub fn write_sub_model(model: Option<&str>) -> Result<()> {
+    let path = config_path().ok_or_else(|| anyhow::anyhow!("no config path (HOME/XDG unset)"))?;
+    edit_sub_table_at(&path, |t| match model.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(m) => t["model"] = toml_edit::value(m),
+        None => {
+            t.remove("model");
+        }
+    })
+}
+
 /// Persist `sub.anthropic_login`: `skip` (dummy token, no Anthropic /login) or `keep` (claude.ai
 /// OAuth for connectors; Anthropic login still required).
 pub fn write_sub_anthropic_login(skip: bool) -> Result<()> {

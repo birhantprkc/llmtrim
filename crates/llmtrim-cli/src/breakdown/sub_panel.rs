@@ -52,13 +52,14 @@ impl SubPanel {
         self.version = st.version;
         self.url = st.base_url;
         self.models = cliproxy::list_models().unwrap_or_default();
-        if self.selected >= self.models.len() {
-            self.selected = self.models.len().saturating_sub(1);
+        let n = self.row_count();
+        if self.selected >= n {
+            self.selected = n.saturating_sub(1);
         }
     }
 
     pub fn preselect_provider(&mut self, _provider: SubProvider) {
-        self.status = "CLIProxyAPI — Enter toggles reroute · r refresh models".into();
+        self.status = "Enter pins a CLIProxyAPI model · x turns reroute off".into();
     }
 
     /// Stable demo state for the README SVG export (not written to disk).
@@ -80,6 +81,24 @@ impl SubPanel {
         self.status = "demo".into();
     }
 
+    fn rows(&self) -> Vec<(String, String)> {
+        if !self.models.is_empty() {
+            return self
+                .models
+                .iter()
+                .map(|m| (m.id.clone(), m.owned_by.clone()))
+                .collect();
+        }
+        cliproxy::BACKENDS
+            .iter()
+            .map(|b| (b.id.to_string(), b.aliases.join(", ")))
+            .collect()
+    }
+
+    fn row_count(&self) -> usize {
+        self.rows().len()
+    }
+
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode;
         match code {
@@ -90,13 +109,18 @@ impl SubPanel {
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.models.is_empty() && self.selected + 1 < self.models.len() {
+                let n = self.row_count();
+                if n > 0 && self.selected + 1 < n {
                     self.selected += 1;
                 }
                 true
             }
             KeyCode::Enter => {
-                self.toggle();
+                self.pin_selected();
+                true
+            }
+            KeyCode::Char('x') | KeyCode::Backspace => {
+                self.turn_off();
                 true
             }
             KeyCode::Char('r') => {
@@ -108,35 +132,64 @@ impl SubPanel {
         }
     }
 
-    fn toggle(&mut self) {
-        if self.enabled {
-            if let Err(e) = llmtrim_core::config::disable_sub() {
-                self.status = format!("could not disable: {e:#}");
-                return;
-            }
-            let _ = cliproxy::stop();
-            self.enabled = false;
-            self.needs_apply = true;
-            self.status = "reroute off".into();
-        } else {
-            if let Err(e) = cliproxy::ensure_running() {
-                self.status = format!("CLIProxyAPI: {e:#}");
-                return;
-            }
-            if let Err(e) = llmtrim_core::config::enable_sub("on") {
-                self.status = format!("could not enable: {e:#}");
-                return;
-            }
-            self.enabled = true;
-            self.running = cliproxy::is_running();
-            self.needs_apply = true;
-            self.status = "reroute on via CLIProxyAPI".into();
+    fn pin_selected(&mut self) {
+        let rows = self.rows();
+        let Some((id, _)) = rows.get(self.selected) else {
+            self.turn_on();
+            return;
+        };
+        let id = id.clone();
+        if let Err(e) = cliproxy::ensure_running() {
+            self.status = format!("CLIProxyAPI: {e:#}");
+            return;
         }
+        if let Err(e) = llmtrim_core::config::enable_sub("on") {
+            self.status = format!("could not enable: {e:#}");
+            return;
+        }
+        if let Err(e) = llmtrim_core::config::write_sub_model(Some(&id)) {
+            self.status = format!("could not pin {id}: {e:#}");
+            return;
+        }
+        self.enabled = true;
+        self.running = cliproxy::is_running();
+        self.needs_apply = true;
+        self.status = format!("pinned {id}");
+        self.refresh();
+    }
+
+    fn turn_on(&mut self) {
+        if let Err(e) = cliproxy::ensure_running() {
+            self.status = format!("CLIProxyAPI: {e:#}");
+            return;
+        }
+        if let Err(e) = llmtrim_core::config::enable_sub("on") {
+            self.status = format!("could not enable: {e:#}");
+            return;
+        }
+        let _ = llmtrim_core::config::write_sub_model(None);
+        self.enabled = true;
+        self.running = cliproxy::is_running();
+        self.needs_apply = true;
+        self.status = "reroute on via CLIProxyAPI".into();
+        self.refresh();
+    }
+
+    fn turn_off(&mut self) {
+        if let Err(e) = llmtrim_core::config::disable_sub() {
+            self.status = format!("could not disable: {e:#}");
+            return;
+        }
+        let _ = llmtrim_core::config::write_sub_model(None);
+        let _ = cliproxy::stop();
+        self.enabled = false;
+        self.needs_apply = true;
+        self.status = "reroute off".into();
         self.refresh();
     }
 
     pub fn help_keys(&self) -> &'static str {
-        " Tab tabs · ↑↓ models · ⏎ on/off · r refresh · t theme · q"
+        " Tab tabs · ↑↓ models · ⏎ pin · x off · r refresh · t theme · q"
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
@@ -176,23 +229,21 @@ impl SubPanel {
                 Span::raw(format!("{state}{ver}")),
             ]),
             Line::from(self.url.as_str()),
-            Line::from("Enter toggles reroute. Sign in: llmtrim sub auth"),
+            Line::from("Enter pins a model/CLI. x off. Sign in: llmtrim sub auth"),
         ]);
         f.render_widget(header, chunks[0]);
 
-        if self.models.is_empty() {
-            let empty = if self.running {
-                "No models yet — run `llmtrim sub auth` to sign in."
-            } else {
-                "Sidecar not running — Enter to start, or `llmtrim sub on`."
-            };
-            f.render_widget(Paragraph::new(empty), chunks[1]);
+        let rows = self.rows();
+        if rows.is_empty() {
+            f.render_widget(
+                Paragraph::new("Sidecar not running — Enter to start, or `llmtrim sub on`."),
+                chunks[1],
+            );
         } else {
-            let rows: Vec<Row> = self
-                .models
+            let table_rows: Vec<Row> = rows
                 .iter()
                 .enumerate()
-                .map(|(i, m)| {
+                .map(|(i, (id, owner))| {
                     let style = if i == self.selected {
                         Style::default()
                             .fg(palette::accent())
@@ -200,15 +251,21 @@ impl SubPanel {
                     } else {
                         Style::default()
                     };
-                    Row::new(vec![m.id.clone(), m.owned_by.clone()]).style(style)
+                    Row::new(vec![id.clone(), owner.clone()]).style(style)
                 })
                 .collect();
+            let col2 = if self.models.is_empty() {
+                "cli aliases"
+            } else {
+                "owned_by"
+            };
             let table = Table::new(
-                rows,
+                table_rows,
                 [Constraint::Percentage(65), Constraint::Percentage(35)],
             )
             .header(
-                Row::new(vec!["model", "owned_by"]).style(Style::default().add_modifier(Modifier::BOLD)),
+                Row::new(vec!["model / cli", col2])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
             );
             f.render_widget(table, chunks[1]);
         }
@@ -241,7 +298,7 @@ pub fn apply_pending_changes() -> String {
         Err(e) => parts.push(format!("Claude Code auth env update failed: {e:#}")),
     }
     if llmtrim_core::config::sub_always_on()
-        && let Err(e) = cliproxy::ensure_running()
+        && let Err(e) = cliproxy::ensure_for_existing_user()
     {
         parts.push(format!("CLIProxyAPI: {e:#}"));
     }

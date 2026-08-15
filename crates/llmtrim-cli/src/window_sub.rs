@@ -66,10 +66,7 @@ fn valid(value: &str) -> bool {
         && !value.contains("..")
 }
 fn valid_provider(value: &str) -> bool {
-    matches!(
-        value,
-        "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" | "codex" | "kimi" | "grok"
-    ) || valid_model_id(value)
+    crate::reroute::cliproxy::parse_pin_request(value).is_some()
 }
 
 /// A CLIProxyAPI model id that `/sub on <id>` may pin for this window.
@@ -1186,8 +1183,15 @@ mod tests {
         assert!(valid_provider("codex"));
         assert!(valid_provider("kimi"));
         assert!(valid_provider("grok"));
-        assert!(!valid_provider("anthropic"));
-        assert!(!valid_provider("openai"));
+        assert!(valid_provider("gemini"));
+        assert!(valid_provider("claude"));
+        assert!(valid_provider("antigravity"));
+        assert!(valid_provider("qwen"));
+        assert!(valid_provider("copilot"));
+        assert!(valid_provider("vertex"));
+        assert!(valid_provider("openai"));
+        assert!(valid_provider("anthropic"));
+        assert!(!valid_provider("notaprovider"));
     }
 
     #[test]

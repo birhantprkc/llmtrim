@@ -312,6 +312,7 @@ Send Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxy
 
 ```bash
 llmtrim sub on                  # install + start CLIProxyAPI, enable redirect
+llmtrim sub on gemini           # pin that CLIProxyAPI CLI (codex|claude|gemini|grok|kimi|vertex|qwen|copilot)
 llmtrim sub auth                # CLIProxyAPI TUI — sign in to Codex / Claude / Gemini / Grok / …
 llmtrim sub models              # models the sidecar can serve
 llmtrim sub status
@@ -338,7 +339,7 @@ agent files and records an opt-out so `ensure` leaves them removed.
 This window only (installed with ensure; includes subagents; survives `/clear`):
 
 ```text
-/sub on [optional:model-id]   # bare /sub on = CLIProxyAPI with Claude model ids passed through
+/sub on [optional:cli-or-model]  # gemini, codex, claude, grok, kimi, vertex, qwen, copilot, or a model id
 /sub off
 /sub status
 ```

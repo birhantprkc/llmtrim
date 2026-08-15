@@ -2066,10 +2066,9 @@ mod imp {
                 );
                 let window_model_pin: Option<String> = match &window_intent {
                     Some(crate::window_sub::Intent::Enabled { provider })
-                        if crate::reroute::SubProvider::parse(provider).is_none()
-                            && crate::window_sub::valid_model_id(provider) =>
+                        if !crate::reroute::cliproxy::is_passthrough_label(provider) =>
                     {
-                        Some(provider.clone())
+                        crate::reroute::cliproxy::resolve_pin_live(provider)
                     }
                     _ => None,
                 };
@@ -2645,6 +2644,10 @@ mod imp {
                 // still land on the same upstream model through CLIProxyAPI.
                 let tiers = llmtrim_core::config::sub_tiers_for(sub.as_str());
                 let mapped = crate::reroute::resolve_model(sub, &client_model, &tiers);
+                translate_value["model"] = serde_json::Value::String(mapped);
+            } else if let Some(pin) = llmtrim_core::config::sub_model()
+                && let Some(mapped) = crate::reroute::cliproxy::resolve_pin_live(&pin)
+            {
                 translate_value["model"] = serde_json::Value::String(mapped);
             }
             let rewrite = match crate::reroute::cliproxy::rewrite(&translate_value) {

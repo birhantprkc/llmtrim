@@ -40,6 +40,151 @@ pub struct Status {
     pub base_url: String,
 }
 
+/// One CLIProxyAPI login / model family. Names match the sidecar's OAuth CLIs so
+/// `sub on gemini` / `/sub on antigravity` / tab 4 can address the same backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backend {
+    pub id: &'static str,
+    pub aliases: &'static [&'static str],
+    pub owned_by: &'static [&'static str],
+    pub model_prefixes: &'static [&'static str],
+}
+
+pub const BACKENDS: &[Backend] = &[
+    Backend {
+        id: "codex",
+        aliases: &["codex", "chatgpt", "openai"],
+        owned_by: &["openai", "codex"],
+        model_prefixes: &["gpt-"],
+    },
+    Backend {
+        id: "claude",
+        aliases: &["claude", "anthropic"],
+        owned_by: &["anthropic", "claude"],
+        model_prefixes: &["claude-"],
+    },
+    Backend {
+        id: "gemini",
+        aliases: &["gemini", "antigravity", "aistudio"],
+        owned_by: &["google", "gemini", "antigravity"],
+        model_prefixes: &["gemini-"],
+    },
+    Backend {
+        id: "grok",
+        aliases: &["grok", "xai", "x-ai"],
+        owned_by: &["xai", "x-ai", "grok"],
+        model_prefixes: &["grok-"],
+    },
+    Backend {
+        id: "kimi",
+        aliases: &["kimi", "moonshot"],
+        owned_by: &["kimi", "moonshot", "moonshotai"],
+        model_prefixes: &["kimi"],
+    },
+    Backend {
+        id: "vertex",
+        aliases: &["vertex"],
+        owned_by: &["vertex"],
+        model_prefixes: &[],
+    },
+    Backend {
+        id: "qwen",
+        aliases: &["qwen"],
+        owned_by: &["qwen"],
+        model_prefixes: &["qwen"],
+    },
+    Backend {
+        id: "copilot",
+        aliases: &["copilot", "github"],
+        owned_by: &["github", "copilot"],
+        model_prefixes: &[],
+    },
+];
+
+/// Enable sidecar with no model pin (`sub on` / `/sub on`).
+const PASSTHROUGH: &[&str] = &["on", "cliproxy", "cli-proxy", "cli-proxy-api", "cliproxyapi"];
+
+pub fn is_passthrough_label(raw: &str) -> bool {
+    let s = raw.trim().to_ascii_lowercase();
+    PASSTHROUGH.contains(&s.as_str())
+}
+
+pub fn backend_by_alias(raw: &str) -> Option<&'static Backend> {
+    let s = raw.trim().to_ascii_lowercase();
+    BACKENDS.iter().find(|b| b.id == s || b.aliases.contains(&s.as_str()))
+}
+
+impl Backend {
+    pub fn matches(&self, model: &Model) -> bool {
+        let owner = model.owned_by.to_ascii_lowercase();
+        if self.owned_by.iter().any(|o| owner.contains(o)) {
+            return true;
+        }
+        let id = model.id.to_ascii_lowercase();
+        self.model_prefixes
+            .iter()
+            .any(|p| !p.is_empty() && id.starts_with(p))
+    }
+}
+
+/// What `sub on X` / `/sub on X` means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinRequest {
+    /// Just turn the sidecar on; leave Claude model ids alone.
+    Enable,
+    /// Force this CLIProxyAPI model id (or a backend alias to expand later).
+    Pin(String),
+}
+
+pub fn parse_pin_request(raw: &str) -> Option<PinRequest> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if is_passthrough_label(raw) {
+        return Some(PinRequest::Enable);
+    }
+    if backend_by_alias(raw).is_some() {
+        return Some(PinRequest::Pin(raw.trim().to_ascii_lowercase()));
+    }
+    let ok_chars = raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'));
+    if raw.len() <= 160
+        && ok_chars
+        && !raw.contains("..")
+        && (raw.contains('-') || raw.contains('/') || raw.contains('.'))
+    {
+        return Some(PinRequest::Pin(raw.to_string()));
+    }
+    None
+}
+
+/// Turn a stored pin (model id or backend alias) into a wire model id when the sidecar
+/// has published models. Backend aliases with no matching model stay unresolved so the
+/// Claude id is left alone.
+pub fn expand_pin(pin: &str, models: &[Model]) -> Option<String> {
+    if let Some(exact) = models.iter().find(|m| m.id.eq_ignore_ascii_case(pin)) {
+        return Some(exact.id.clone());
+    }
+    let backend = backend_by_alias(pin)?;
+    models
+        .iter()
+        .find(|m| backend.matches(m))
+        .map(|m| m.id.clone())
+}
+
+pub fn resolve_pin_live(pin: &str) -> Option<String> {
+    let models = list_models().unwrap_or_default();
+    expand_pin(pin, &models).or_else(|| {
+        if backend_by_alias(pin).is_some() {
+            None
+        } else {
+            Some(pin.to_string())
+        }
+    })
+}
+
 pub fn dir() -> Result<PathBuf> {
     Ok(crate::daemon::home_dir()?.join("cliproxy"))
 }
@@ -948,5 +1093,61 @@ mod tests {
         .unwrap();
         assert_eq!(grok["type"], "xai");
         assert_eq!(grok["auth_kind"], "oauth");
+    }
+
+    #[test]
+    fn parse_pin_accepts_every_cliproxy_backend() {
+        assert_eq!(parse_pin_request("on"), Some(PinRequest::Enable));
+        assert_eq!(
+            parse_pin_request("gemini"),
+            Some(PinRequest::Pin("gemini".into()))
+        );
+        assert_eq!(
+            parse_pin_request("antigravity"),
+            Some(PinRequest::Pin("antigravity".into()))
+        );
+        assert_eq!(
+            parse_pin_request("claude"),
+            Some(PinRequest::Pin("claude".into()))
+        );
+        assert_eq!(
+            parse_pin_request("vertex"),
+            Some(PinRequest::Pin("vertex".into()))
+        );
+        assert_eq!(
+            parse_pin_request("qwen"),
+            Some(PinRequest::Pin("qwen".into()))
+        );
+        assert_eq!(
+            parse_pin_request("copilot"),
+            Some(PinRequest::Pin("copilot".into()))
+        );
+        assert_eq!(
+            parse_pin_request("gpt-5.4"),
+            Some(PinRequest::Pin("gpt-5.4".into()))
+        );
+        assert!(parse_pin_request("off").is_none());
+        assert!(parse_pin_request("no spaces allowed here!").is_none());
+    }
+
+    #[test]
+    fn expand_pin_uses_owned_by_then_prefix() {
+        let models = vec![
+            Model {
+                id: "gemini-3-flash".into(),
+                owned_by: "google".into(),
+            },
+            Model {
+                id: "gpt-5.4".into(),
+                owned_by: "openai".into(),
+            },
+        ];
+        assert_eq!(
+            expand_pin("gemini", &models).as_deref(),
+            Some("gemini-3-flash")
+        );
+        assert_eq!(expand_pin("codex", &models).as_deref(), Some("gpt-5.4"));
+        assert_eq!(expand_pin("gpt-5.4", &models).as_deref(), Some("gpt-5.4"));
+        assert_eq!(expand_pin("kimi", &models), None);
     }
 }

@@ -15,8 +15,10 @@ All notable changes to this project are documented here. The format follows
   sidecar when you use it. Existing `sub = codex|kimi|grok` configs keep working: `update`
   / `ensure` install the sidecar, import stored tokens, and keep the old tier→model map.
   First-party protocol translation is no longer the live path.
-  (`LLMTRIM_CLIPROXY_URL` / `LLMTRIM_CLIPROXY_KEY` point at an existing instance instead
-  of the managed sidecar.)
+  `llmtrim sub on`, `/sub on`, and status tab 4 accept every CLIProxyAPI CLI
+  (codex, claude, gemini/antigravity, grok, kimi, vertex, qwen, copilot) plus live
+  model ids from the sidecar. (`LLMTRIM_CLIPROXY_URL` / `LLMTRIM_CLIPROXY_KEY` point
+  at an existing instance instead of the managed sidecar.)
 
 - **Grok flagship is `grok-4.6`.** Default Grok tier preset maps Opus/Sonnet/Fable to
   `grok-4.6` (replacing `grok-4.5`); Haiku stays on `grok-composer-2.5-fast`. The subscription
