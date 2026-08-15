@@ -636,6 +636,24 @@ pub fn apply(opts: Options) -> Result<Report> {
         }
     }
 
+    // Existing `sub = codex|kimi|grok|on` users: install CLIProxyAPI, import tokens, start it.
+    #[cfg(feature = "intercept")]
+    if crate::reroute::cliproxy::is_enabled() {
+        match crate::reroute::cliproxy::ensure_for_existing_user() {
+            Ok(msg) => {
+                report.applied.push("cliproxy");
+                report
+                    .rows
+                    .push((ui::OK, "CLIProxyAPI".into(), msg));
+            }
+            Err(e) => report.rows.push((
+                ui::WARN,
+                "CLIProxyAPI".into(),
+                format!("{e:#} — `llmtrim sub on` to retry"),
+            )),
+        }
+    }
+
     // Daemon version skew.
     if opts.restart_daemon
         && let Some(d) = crate::daemon::running()

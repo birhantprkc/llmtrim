@@ -647,21 +647,197 @@ pub fn update_if_used() -> Result<Option<String>> {
         return Ok(None);
     }
     if !is_installed() {
-        return Ok(None);
+        if !is_enabled() {
+            return Ok(None);
+        }
+        return ensure_for_existing_user().map(Some);
     }
     let latest = fetch_latest_tag()?;
     if installed_version().as_deref() == Some(latest.as_str()) {
-        return Ok(Some(format!("CLIProxyAPI already {latest}")));
+        let imported = migrate_legacy_tokens()?;
+        if is_enabled() {
+            let _ = ensure_running();
+        }
+        if imported.is_empty() {
+            return Ok(Some(format!("CLIProxyAPI already {latest}")));
+        }
+        return Ok(Some(format!(
+            "CLIProxyAPI already {latest}; imported {}",
+            imported.join(", ")
+        )));
     }
     let was_running = pid_running().is_some() || is_enabled();
     if pid_running().is_some() {
         let _ = stop();
     }
     install_tag(&latest)?;
+    let imported = migrate_legacy_tokens()?;
     if was_running {
         let _ = ensure_running();
     }
-    Ok(Some(format!("CLIProxyAPI updated to {latest}")))
+    let mut msg = format!("CLIProxyAPI updated to {latest}");
+    if !imported.is_empty() {
+        msg.push_str(&format!("; imported {}", imported.join(", ")));
+    }
+    Ok(Some(msg))
+}
+
+/// Install, import existing `sub` tokens, and start the sidecar. Used by `ensure` / `update`
+/// so a user who already had `sub = codex|kimi|grok` needs no extra command.
+pub fn ensure_for_existing_user() -> Result<String> {
+    if is_externally_configured() {
+        if is_healthy() {
+            return Ok(format!("CLIProxyAPI at {} reachable", base_url()));
+        }
+        bail!("CLIProxyAPI at {} is not reachable", base_url());
+    }
+    ensure_installed()?;
+    ensure_config()?;
+    let imported = migrate_legacy_tokens()?;
+    ensure_running()?;
+    if imported.is_empty() {
+        Ok(format!("CLIProxyAPI ready at {}", base_url()))
+    } else {
+        Ok(format!(
+            "CLIProxyAPI ready at {}; imported {}",
+            base_url(),
+            imported.join(", ")
+        ))
+    }
+}
+
+/// Copy first-party `~/.llmtrim/{{codex,kimi,grok}}/auth.json` into the CLIProxyAPI auth dir
+/// once. Existing sidecar files are left alone.
+pub fn migrate_legacy_tokens() -> Result<Vec<String>> {
+    let dest = auth_dir();
+    fs::create_dir_all(&dest)?;
+    let home = crate::daemon::home_dir()?;
+    let mut imported = Vec::new();
+    if import_one(
+        &home.join("codex").join("auth.json"),
+        &dest.join("codex-llmtrim.json"),
+        convert_codex_auth,
+    )? {
+        imported.push("codex".into());
+    }
+    if import_one(
+        &home.join("kimi").join("auth.json"),
+        &dest.join("kimi-llmtrim.json"),
+        convert_kimi_auth,
+    )? {
+        imported.push("kimi".into());
+    }
+    if import_one(
+        &home.join("grok").join("auth.json"),
+        &dest.join("xai-llmtrim.json"),
+        convert_grok_auth,
+    )? {
+        imported.push("grok".into());
+    }
+    Ok(imported)
+}
+
+fn import_one(
+    src: &Path,
+    dest: &Path,
+    convert: fn(&Value) -> Option<Value>,
+) -> Result<bool> {
+    if dest.is_file() || !src.is_file() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(src)
+        .with_context(|| format!("read {}", src.display()))?;
+    let src_val: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", src.display()))?;
+    let Some(out) = convert(&src_val) else {
+        return Ok(false);
+    };
+    let bytes = serde_json::to_vec_pretty(&out)?;
+    fs::write(dest, bytes).with_context(|| format!("write {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dest, fs::Permissions::from_mode(0o600));
+    }
+    Ok(true)
+}
+
+fn epoch_ms_to_rfc3339(ms: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_millis_opt(ms as i64)
+        .single()
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+fn json_str(v: &Value, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = v.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn json_expires_ms(v: &Value) -> Option<u64> {
+    v.get("expires")
+        .and_then(Value::as_u64)
+        .or_else(|| v.get("expires").and_then(Value::as_i64).map(|n| n as u64))
+}
+
+pub(crate) fn convert_codex_auth(src: &Value) -> Option<Value> {
+    let access = json_str(src, &["access", "access_token"])?;
+    let refresh = json_str(src, &["refresh", "refresh_token"])?;
+    let account = json_str(src, &["accountId", "account_id"]).unwrap_or_default();
+    let expired = json_expires_ms(src)
+        .map(epoch_ms_to_rfc3339)
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "type": "codex",
+        "access_token": access,
+        "refresh_token": refresh,
+        "id_token": json_str(src, &["id_token"]).unwrap_or_default(),
+        "account_id": account,
+        "email": "llmtrim-migrated",
+        "last_refresh": chrono::Utc::now().to_rfc3339(),
+        "expired": expired,
+    }))
+}
+
+pub(crate) fn convert_kimi_auth(src: &Value) -> Option<Value> {
+    let access = json_str(src, &["access", "access_token"])?;
+    let refresh = json_str(src, &["refresh", "refresh_token"])?;
+    let expired = json_expires_ms(src)
+        .map(epoch_ms_to_rfc3339)
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "type": "kimi",
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "Bearer",
+        "scope": json_str(src, &["scope"]).unwrap_or_default(),
+        "device_id": json_str(src, &["device_id", "deviceId", "userId"]).unwrap_or_default(),
+        "expired": expired,
+    }))
+}
+
+pub(crate) fn convert_grok_auth(src: &Value) -> Option<Value> {
+    let access = json_str(src, &["access", "access_token"])?;
+    let refresh = json_str(src, &["refresh", "refresh_token"])?;
+    let expired = json_expires_ms(src)
+        .map(epoch_ms_to_rfc3339)
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "type": "xai",
+        "auth_kind": "oauth",
+        "access_token": access,
+        "refresh_token": refresh,
+        "id_token": json_str(src, &["id_token"]).unwrap_or_default(),
+        "token_type": "Bearer",
+        "expired": expired,
+        "last_refresh": chrono::Utc::now().to_rfc3339(),
+        "email": "llmtrim-migrated",
+    }))
 }
 
 #[cfg(test)]
@@ -734,5 +910,43 @@ mod tests {
         assert_eq!(models[0].id, "gemini-3-flash");
         assert_eq!(models[1].id, "gpt-5.4");
         assert_eq!(models[1].owned_by, "openai");
+    }
+
+    #[test]
+    fn convert_codex_maps_llmtrim_auth_json() {
+        let src = json!({
+            "access": "at-1",
+            "refresh": "rt-1",
+            "expires": 1_700_000_000_000u64,
+            "accountId": "acct-9"
+        });
+        let out = convert_codex_auth(&src).unwrap();
+        assert_eq!(out["type"], "codex");
+        assert_eq!(out["access_token"], "at-1");
+        assert_eq!(out["refresh_token"], "rt-1");
+        assert_eq!(out["account_id"], "acct-9");
+        assert!(out["expired"].as_str().unwrap().contains("2023"));
+    }
+
+    #[test]
+    fn convert_kimi_and_grok_require_refresh() {
+        assert!(convert_kimi_auth(&json!({"access": "a"})).is_none());
+        let kimi = convert_kimi_auth(&json!({
+            "access": "a",
+            "refresh": "r",
+            "expires": 1_700_000_000_000u64,
+            "userId": "u1"
+        }))
+        .unwrap();
+        assert_eq!(kimi["type"], "kimi");
+        assert_eq!(kimi["device_id"], "u1");
+        let grok = convert_grok_auth(&json!({
+            "access": "a",
+            "refresh": "r",
+            "expires": 1_700_000_000_000u64
+        }))
+        .unwrap();
+        assert_eq!(grok["type"], "xai");
+        assert_eq!(grok["auth_kind"], "oauth");
     }
 }

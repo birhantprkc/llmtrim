@@ -157,6 +157,7 @@ pub fn run() -> Result<()> {
                 "{}",
                 crate::ui::ok(color, &format!("Already up to date (v{CURRENT})."))
             );
+            update_cliproxy();
             return Ok(());
         }
         Some(v) => println!(
@@ -283,6 +284,8 @@ pub fn run() -> Result<()> {
                 if let Some(v) = latest {
                     write_cache(&v); // clear the `monitor` banner
                 }
+                // Sidecar first so the restarted daemon can bind to a running CLIProxyAPI.
+                update_cliproxy();
                 // Always finish on the new binary: in-process ensure would stamp the old
                 // CARGO_PKG_VERSION and rewrite Claude hooks with a ghost `(deleted)` path.
                 restart_daemon(color)?;
@@ -291,6 +294,11 @@ pub fn run() -> Result<()> {
         }
     }
     // Package-manager channels: the panel already ends with `llmtrim ensure`.
+    update_cliproxy();
+    Ok(())
+}
+
+fn update_cliproxy() {
     #[cfg(feature = "intercept")]
     {
         match crate::reroute::cliproxy::update_if_used() {
@@ -299,7 +307,6 @@ pub fn run() -> Result<()> {
             Err(e) => eprintln!("llmtrim: CLIProxyAPI update skipped: {e:#}"),
         }
     }
-    Ok(())
 }
 
 /// Path to the on-disk llmtrim to spawn after a self-replacing install (never a deleted path).

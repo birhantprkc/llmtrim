@@ -2640,6 +2640,12 @@ mod imp {
                 .map(|c| c.logical_model.as_str())
             {
                 translate_value["model"] = serde_json::Value::String(logical.to_string());
+            } else if sub != crate::reroute::SubProvider::CliProxy {
+                // Legacy `sub = codex|kimi|grok` keeps its tier map so existing users
+                // still land on the same upstream model through CLIProxyAPI.
+                let tiers = llmtrim_core::config::sub_tiers_for(sub.as_str());
+                let mapped = crate::reroute::resolve_model(sub, &client_model, &tiers);
+                translate_value["model"] = serde_json::Value::String(mapped);
             }
             let rewrite = match crate::reroute::cliproxy::rewrite(&translate_value) {
                 Ok(r) => r,
@@ -5407,7 +5413,7 @@ mod imp {
         }
 
         if handler.sub.is_some()
-            && let Err(e) = crate::reroute::cliproxy::ensure_running()
+            && let Err(e) = crate::reroute::cliproxy::ensure_for_existing_user()
         {
             eprintln!("llmtrim: CLIProxyAPI sidecar: {e}");
         }
