@@ -504,13 +504,13 @@ impl SubPanel {
 
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
-            Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q",
+            Focus::Presets => {
+                " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q"
+            }
             Focus::Map if self.map_dirty => {
                 " ← from · → to · ↑↓ pick · Enter pick · s SAVE · a add · d del · Esc discard"
             }
-            Focus::Map => {
-                " ← from · → to · ↑↓ pick · Enter pick · s save · a add · d del · Esc"
-            }
+            Focus::Map => " ← from · → to · ↑↓ pick · Enter pick · s save · a add · d del · Esc",
         }
     }
 
@@ -581,7 +581,11 @@ impl SubPanel {
             .enumerate()
             .map(|(i, (from, to))| {
                 let active = self.focus == Focus::Map && i == self.row;
-                let from_s = if from.is_empty() { "…" } else { from.as_str() };
+                let from_s = if from.is_empty() {
+                    "…"
+                } else {
+                    from.as_str()
+                };
                 let to_s = if to.is_empty() {
                     "(pass through)"
                 } else {
@@ -611,11 +615,13 @@ impl SubPanel {
                 ])
             })
             .collect();
-        let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
-            .header(
-                Row::new(vec!["input", "output"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            );
+        let table = Table::new(
+            rows,
+            [Constraint::Percentage(40), Constraint::Percentage(60)],
+        )
+        .header(
+            Row::new(vec!["input", "output"]).style(Style::default().add_modifier(Modifier::BOLD)),
+        );
         f.render_widget(table, chunks[1]);
 
         if self.focus == Focus::Map {

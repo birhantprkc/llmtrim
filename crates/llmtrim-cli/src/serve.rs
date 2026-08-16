@@ -2661,9 +2661,7 @@ mod imp {
 
             if let Some(model) = explicit_model.as_deref() {
                 translate_value["model"] = serde_json::Value::String(model.to_string());
-            } else if let Some(logical) = compact_current
-                .as_ref()
-                .map(|c| c.logical_model.as_str())
+            } else if let Some(logical) = compact_current.as_ref().map(|c| c.logical_model.as_str())
             {
                 translate_value["model"] = serde_json::Value::String(logical.to_string());
             } else {
@@ -2685,9 +2683,10 @@ mod imp {
                         }
                     } else if hop != "on" {
                         let catalog = crate::reroute::cliproxy::official_models();
-                        if let Some(id) =
-                            crate::reroute::cliproxy::expand_pin(&hop, &catalog.iter().map(|m| m.as_live()).collect::<Vec<_>>())
-                        {
+                        if let Some(id) = crate::reroute::cliproxy::expand_pin(
+                            &hop,
+                            &catalog.iter().map(|m| m.as_live()).collect::<Vec<_>>(),
+                        ) {
                             translate_value["model"] = serde_json::Value::String(id);
                         }
                     }
@@ -2696,7 +2695,8 @@ mod imp {
                     && let Some(backend) = crate::reroute::cliproxy::backend_by_alias(&provider)
                 {
                     let catalog = crate::reroute::cliproxy::official_models();
-                    let mapped = crate::reroute::cliproxy::default_tier_map(Some(backend), &catalog);
+                    let mapped =
+                        crate::reroute::cliproxy::default_tier_map(Some(backend), &catalog);
                     if !mapped.is_empty() {
                         tiers = mapped;
                     }
@@ -3651,7 +3651,11 @@ mod imp {
                     }
                 };
                 match self
-                    .reissue_reroute(&rewrite.url(), rewrite.headers.clone(), Arc::new(rewrite.body.clone()))
+                    .reissue_reroute(
+                        &rewrite.url(),
+                        rewrite.headers.clone(),
+                        Arc::new(rewrite.body.clone()),
+                    )
                     .await
                 {
                     Some((status, raw, _)) if (200..300).contains(&status) => {
@@ -3687,7 +3691,7 @@ mod imp {
                     None => failures.push(format!("{hop}: no response")),
                 }
             }
-                        self.fallback_error(
+            self.fallback_error(
                 pending,
                 &client_model,
                 &format!(

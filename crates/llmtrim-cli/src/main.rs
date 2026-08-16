@@ -1230,11 +1230,7 @@ fn run_sub(action: SubCmd) -> Result<()> {
             println!("Installing/starting CLIProxyAPI…");
             llmtrim::reroute::cliproxy::ensure_running()?;
             llmtrim_core::config::enable_sub("on")?;
-            match provider
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
+            match provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None => {
                     llmtrim_core::config::write_sub_model(None)?;
                 }
@@ -1328,9 +1324,7 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 }
             }
             if chain.is_empty() {
-                anyhow::bail!(
-                    "fallback chain is empty (e.g. anthropic,codex or codex,anthropic)"
-                );
+                anyhow::bail!("fallback chain is empty (e.g. anthropic,codex or codex,anthropic)");
             }
             llmtrim_core::config::write_sub_chain(&chain)?;
             println!("Fallback chain: {}.", chain.join(" -> "));

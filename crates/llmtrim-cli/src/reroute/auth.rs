@@ -97,7 +97,9 @@ pub fn get_token(provider: SubProvider) -> Result<TokenSet> {
             })
         }
         SubProvider::CliProxy => {
-            anyhow::bail!("CLIProxyAPI auth is `llmtrim sub auth` (sidecar TUI), not a stored token")
+            anyhow::bail!(
+                "CLIProxyAPI auth is `llmtrim sub auth` (sidecar TUI), not a stored token"
+            )
         }
     }
 }

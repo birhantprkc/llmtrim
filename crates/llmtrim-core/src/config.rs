@@ -1318,10 +1318,12 @@ fn resolve_sub_model(
 /// Persist or clear the global CLIProxyAPI model pin.
 pub fn write_sub_model(model: Option<&str>) -> Result<()> {
     let path = config_path().ok_or_else(|| anyhow::anyhow!("no config path (HOME/XDG unset)"))?;
-    edit_sub_table_at(&path, |t| match model.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(m) => t["model"] = toml_edit::value(m),
-        None => {
-            t.remove("model");
+    edit_sub_table_at(&path, |t| {
+        match model.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(m) => t["model"] = toml_edit::value(m),
+            None => {
+                t.remove("model");
+            }
         }
     })
 }

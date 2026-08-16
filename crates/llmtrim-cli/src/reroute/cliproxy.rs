@@ -102,7 +102,13 @@ pub const BACKENDS: &[Backend] = &[
 ];
 
 /// Enable sidecar with no model pin (`sub on` / `/sub on`).
-const PASSTHROUGH: &[&str] = &["on", "cliproxy", "cli-proxy", "cli-proxy-api", "cliproxyapi"];
+const PASSTHROUGH: &[&str] = &[
+    "on",
+    "cliproxy",
+    "cli-proxy",
+    "cli-proxy-api",
+    "cliproxyapi",
+];
 
 /// A fallback-chain hop: real Anthropic, or a CLIProxyAPI CLI family.
 pub fn parse_hop(raw: &str) -> Option<String> {
@@ -120,7 +126,10 @@ pub fn parse_hop(raw: &str) -> Option<String> {
 }
 
 pub fn is_anthropic_hop(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "anthropic" | "direct")
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "anthropic" | "direct"
+    )
 }
 
 pub fn is_passthrough_label(raw: &str) -> bool {
@@ -130,7 +139,9 @@ pub fn is_passthrough_label(raw: &str) -> bool {
 
 pub fn backend_by_alias(raw: &str) -> Option<&'static Backend> {
     let s = raw.trim().to_ascii_lowercase();
-    BACKENDS.iter().find(|b| b.id == s || b.aliases.contains(&s.as_str()))
+    BACKENDS
+        .iter()
+        .find(|b| b.id == s || b.aliases.contains(&s.as_str()))
 }
 
 impl Backend {
@@ -450,12 +461,9 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn installed_version() -> Option<String> {
-    fs::read_to_string(version_path().ok()?).ok().map(|s| {
-        s.trim()
-            .trim_start_matches('v')
-            .trim()
-            .to_string()
-    })
+    fs::read_to_string(version_path().ok()?)
+        .ok()
+        .map(|s| s.trim().trim_start_matches('v').trim().to_string())
 }
 
 /// Release asset name for this OS/arch (`None` if we do not ship that target).
@@ -529,7 +537,9 @@ pub fn auth_dir() -> PathBuf {
             return shared;
         }
     }
-    dir().map(|d| d.join("auth")).unwrap_or_else(|_| PathBuf::from("auth"))
+    dir()
+        .map(|d| d.join("auth"))
+        .unwrap_or_else(|_| PathBuf::from("auth"))
 }
 
 pub fn config_yaml(port: u16, key: &str, auth: &Path) -> String {
@@ -767,7 +777,9 @@ fn image_edges(b64: &str) -> Option<(u32, u32)> {
         .decode(b64.trim())
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(b64.trim().replace('\n', "")))
         .ok()?;
-    png_edges(&raw).or_else(|| jpeg_edges(&raw)).or_else(|| gif_edges(&raw))
+    png_edges(&raw)
+        .or_else(|| jpeg_edges(&raw))
+        .or_else(|| gif_edges(&raw))
 }
 
 fn png_edges(raw: &[u8]) -> Option<(u32, u32)> {
@@ -880,8 +892,13 @@ pub fn install_latest() -> Result<String> {
 }
 
 pub fn install_tag(tag: &str) -> Result<()> {
-    let asset = release_asset(tag)
-        .with_context(|| format!("no CLIProxyAPI build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let asset = release_asset(tag).with_context(|| {
+        format!(
+            "no CLIProxyAPI build for {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
     let url = format!("https://github.com/{REPO}/releases/download/v{tag}/{asset}");
     let dest = dir()?;
     fs::create_dir_all(&dest)?;
@@ -928,7 +945,12 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
                 .status()
         } else {
             std::process::Command::new("unzip")
-                .args(["-o", &archive.to_string_lossy(), "-d", &dest.to_string_lossy()])
+                .args([
+                    "-o",
+                    &archive.to_string_lossy(),
+                    "-d",
+                    &dest.to_string_lossy(),
+                ])
                 .status()
         }
         .context("extract CLIProxyAPI zip")?;
@@ -1037,7 +1059,9 @@ pub fn ensure_running() -> Result<()> {
     bail!(
         "CLIProxyAPI started but {}/v1/models is not answering — see {}",
         base_url(),
-        logfile().map(|p| p.display().to_string()).unwrap_or_else(|_| "cliproxy.log".into())
+        logfile()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "cliproxy.log".into())
     );
 }
 
@@ -1071,7 +1095,9 @@ pub fn start() -> Result<u32> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
-    let child = cmd.spawn().with_context(|| format!("spawn {}", bin.display()))?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", bin.display()))?;
     let pid = child.id();
     fs::write(pidfile()?, pid.to_string())?;
     Ok(pid)
@@ -1217,18 +1243,13 @@ pub fn migrate_legacy_tokens() -> Result<Vec<String>> {
     Ok(imported)
 }
 
-fn import_one(
-    src: &Path,
-    dest: &Path,
-    convert: fn(&Value) -> Option<Value>,
-) -> Result<bool> {
+fn import_one(src: &Path, dest: &Path, convert: fn(&Value) -> Option<Value>) -> Result<bool> {
     if dest.is_file() || !src.is_file() {
         return Ok(false);
     }
-    let raw = fs::read_to_string(src)
-        .with_context(|| format!("read {}", src.display()))?;
-    let src_val: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", src.display()))?;
+    let raw = fs::read_to_string(src).with_context(|| format!("read {}", src.display()))?;
+    let src_val: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", src.display()))?;
     let Some(out) = convert(&src_val) else {
         return Ok(false);
     };
@@ -1517,8 +1538,7 @@ mod tests {
         assert!(!map.values().any(|v| v == "claude-opus-5"));
     }
 
-    const PNG_2X2: &str =
-        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
+    const PNG_2X2: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
 
     #[test]
     fn png_2x2_is_tiny() {

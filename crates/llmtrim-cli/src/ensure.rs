@@ -642,9 +642,7 @@ pub fn apply(opts: Options) -> Result<Report> {
         match crate::reroute::cliproxy::ensure_for_existing_user() {
             Ok(msg) => {
                 report.applied.push("cliproxy");
-                report
-                    .rows
-                    .push((ui::OK, "CLIProxyAPI".into(), msg));
+                report.rows.push((ui::OK, "CLIProxyAPI".into(), msg));
             }
             Err(e) => report.rows.push((
                 ui::WARN,
