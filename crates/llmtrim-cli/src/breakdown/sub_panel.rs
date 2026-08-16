@@ -291,13 +291,13 @@ impl SubPanel {
                     self.col = Col::From;
                     self.search.clear();
                     self.refilter();
-                    self.status = "editing input (Claude tier or model id)".into();
+                    self.status = "editing input (incoming model or tier)".into();
                 }
                 KeyCode::Right => {
                     self.col = Col::To;
                     self.search.clear();
                     self.refilter();
-                    self.status = "editing output (CLIProxyAPI model)".into();
+                    self.status = "editing output (mapped model)".into();
                 }
                 KeyCode::Up => self.move_pick(-1),
                 KeyCode::Down => self.move_pick(1),
@@ -613,7 +613,7 @@ impl SubPanel {
             .collect();
         let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
             .header(
-                Row::new(vec!["input (Claude)", "output (CLIProxyAPI)"])
+                Row::new(vec!["input", "output"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             );
         f.render_widget(table, chunks[1]);
