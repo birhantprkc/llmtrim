@@ -2066,7 +2066,8 @@ mod imp {
                 );
                 let window_model_pin: Option<String> = match &window_intent {
                     Some(crate::window_sub::Intent::Enabled { provider })
-                        if !crate::reroute::cliproxy::is_passthrough_label(provider) =>
+                        if !crate::reroute::cliproxy::is_passthrough_label(provider)
+                            && crate::reroute::cliproxy::backend_by_alias(provider).is_none() =>
                     {
                         crate::reroute::cliproxy::resolve_pin_live(provider)
                     }
@@ -2639,16 +2640,29 @@ mod imp {
                 .map(|c| c.logical_model.as_str())
             {
                 translate_value["model"] = serde_json::Value::String(logical.to_string());
-            } else if sub != crate::reroute::SubProvider::CliProxy {
-                // Legacy `sub = codex|kimi|grok` keeps its tier map so existing users
-                // still land on the same upstream model through CLIProxyAPI.
-                let tiers = llmtrim_core::config::sub_tiers_for(sub.as_str());
+            } else {
+                // Legacy `sub = codex|kimi|grok` and `sub = on` both honor [sub.<active>.tiers]
+                // (opus/sonnet/haiku/fable → CLIProxyAPI model). No global single-model pin.
+                let key = if sub == crate::reroute::SubProvider::CliProxy {
+                    "on"
+                } else {
+                    sub.as_str()
+                };
+                let mut tiers = llmtrim_core::config::sub_tiers_for(key);
+                if let Some(win) = crate::window_sub::lookup(session_id.as_deref())
+                    && let crate::window_sub::Intent::Enabled { provider } = win
+                    && let Some(backend) = crate::reroute::cliproxy::backend_by_alias(&provider)
+                {
+                    let catalog = crate::reroute::cliproxy::official_models();
+                    let mapped = crate::reroute::cliproxy::default_tier_map(Some(backend), &catalog);
+                    if !mapped.is_empty() {
+                        tiers = mapped;
+                    }
+                }
                 let mapped = crate::reroute::resolve_model(sub, &client_model, &tiers);
-                translate_value["model"] = serde_json::Value::String(mapped);
-            } else if let Some(pin) = llmtrim_core::config::sub_model()
-                && let Some(mapped) = crate::reroute::cliproxy::resolve_pin_live(&pin)
-            {
-                translate_value["model"] = serde_json::Value::String(mapped);
+                if mapped != client_model {
+                    translate_value["model"] = serde_json::Value::String(mapped);
+                }
             }
             let rewrite = match crate::reroute::cliproxy::rewrite(&translate_value) {
                 Ok(r) => r,

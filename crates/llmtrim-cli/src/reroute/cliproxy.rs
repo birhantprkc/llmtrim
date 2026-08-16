@@ -185,6 +185,206 @@ pub fn resolve_pin_live(pin: &str) -> Option<String> {
     })
 }
 
+const OFFICIAL_MODELS_URL: &str = "https://models.router-for.me/models.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialModel {
+    pub id: String,
+    pub owned_by: String,
+    pub display_name: String,
+    pub family: String,
+}
+
+impl OfficialModel {
+    pub fn as_live(&self) -> Model {
+        Model {
+            id: self.id.clone(),
+            owned_by: self.owned_by.clone(),
+        }
+    }
+}
+
+fn official_cache_path() -> Result<PathBuf> {
+    Ok(dir()?.join("official-models.json"))
+}
+
+pub fn parse_official_models(raw: &Value) -> Vec<OfficialModel> {
+    let Some(obj) = raw.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (family, arr) in obj {
+        let Some(list) = arr.as_array() else {
+            continue;
+        };
+        for item in list {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            out.push(OfficialModel {
+                id: id.to_string(),
+                owned_by: item
+                    .get("owned_by")
+                    .and_then(Value::as_str)
+                    .unwrap_or(family)
+                    .to_string(),
+                display_name: item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_string(),
+                family: family.clone(),
+            });
+        }
+    }
+    out
+}
+
+pub fn search_official(catalog: &[OfficialModel], query: &str) -> Vec<OfficialModel> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return catalog.to_vec();
+    }
+    catalog
+        .iter()
+        .filter(|m| {
+            m.id.to_ascii_lowercase().contains(&q)
+                || m.display_name.to_ascii_lowercase().contains(&q)
+                || m.family.to_ascii_lowercase().contains(&q)
+                || m.owned_by.to_ascii_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect()
+}
+
+fn skip_aux_model(id: &str) -> bool {
+    let i = id.to_ascii_lowercase();
+    i.contains("imagine")
+        || i.contains("video")
+        || i.contains("image")
+        || i.contains("tts")
+        || i.contains("embed")
+}
+
+pub fn default_tier_map(
+    backend: Option<&Backend>,
+    catalog: &[OfficialModel],
+) -> std::collections::BTreeMap<String, String> {
+    let pool: Vec<&OfficialModel> = catalog
+        .iter()
+        .filter(|m| !skip_aux_model(&m.id))
+        .filter(|m| backend.is_none_or(|b| b.matches(&m.as_live())))
+        .collect();
+    if pool.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let is_small = |m: &OfficialModel| {
+        let i = m.id.to_ascii_lowercase();
+        i.contains("fast")
+            || i.contains("mini")
+            || i.contains("flash")
+            || i.contains("lite")
+            || i.contains("haiku")
+            || i.contains("composer")
+    };
+    let is_flagship = |m: &OfficialModel| {
+        let i = m.id.to_ascii_lowercase();
+        i.contains("opus") || i.contains("pro") || i.contains("terra") || i.contains("4.6")
+    };
+    let haiku = pool
+        .iter()
+        .copied()
+        .find(|m| is_small(m))
+        .unwrap_or(pool[pool.len() - 1]);
+    let opus = pool
+        .iter()
+        .copied()
+        .find(|m| is_flagship(m) && !is_small(m))
+        .or_else(|| pool.iter().copied().find(|m| !is_small(m)))
+        .unwrap_or(pool[0]);
+    let sonnet = pool
+        .iter()
+        .copied()
+        .find(|m| !is_small(m) && m.id != opus.id && !m.id.to_ascii_lowercase().contains("opus"))
+        .unwrap_or(opus);
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("opus".into(), opus.id.clone());
+    map.insert("fable".into(), opus.id.clone());
+    map.insert("sonnet".into(), sonnet.id.clone());
+    map.insert("haiku".into(), haiku.id.clone());
+    map
+}
+
+pub fn official_models() -> Vec<OfficialModel> {
+    if let Some(cached) = read_official_cache() {
+        return cached;
+    }
+    match fetch_official_models() {
+        Ok(list) if !list.is_empty() => list,
+        _ => list_models()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| OfficialModel {
+                id: m.id,
+                owned_by: m.owned_by,
+                display_name: String::new(),
+                family: String::new(),
+            })
+            .collect(),
+    }
+}
+
+fn read_official_cache() -> Option<Vec<OfficialModel>> {
+    let path = official_cache_path().ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let at = v.get("fetched_at").and_then(Value::as_u64).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(at) > 86_400 {
+        return None;
+    }
+    let models = parse_official_models(v.get("models").unwrap_or(&v));
+    (!models.is_empty()).then_some(models)
+}
+
+pub fn fetch_official_models() -> Result<Vec<OfficialModel>> {
+    let mut req = ureq::get(OFFICIAL_MODELS_URL)
+        .config()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .http_status_as_error(true)
+        .build();
+    req = req.header("User-Agent", "llmtrim-cliproxy");
+    let body = req
+        .call()
+        .context("official CLIProxyAPI models")?
+        .body_mut()
+        .read_to_string()
+        .context("read official models")?;
+    let v: Value = serde_json::from_str(&body).context("parse official models")?;
+    let list = parse_official_models(&v);
+    if let Ok(path) = official_cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = fs::write(
+            path,
+            serde_json::json!({ "fetched_at": now, "models": v }).to_string(),
+        );
+    }
+    Ok(list)
+}
+
 pub fn dir() -> Result<PathBuf> {
     Ok(crate::daemon::home_dir()?.join("cliproxy"))
 }
@@ -1149,5 +1349,31 @@ mod tests {
         assert_eq!(expand_pin("codex", &models).as_deref(), Some("gpt-5.4"));
         assert_eq!(expand_pin("gpt-5.4", &models).as_deref(), Some("gpt-5.4"));
         assert_eq!(expand_pin("kimi", &models), None);
+    }
+
+    #[test]
+    fn official_catalog_search_and_tier_defaults() {
+        let raw = json!({
+            "xai": [
+                {"id": "grok-4.6", "owned_by": "xai", "display_name": "Grok 4.6"},
+                {"id": "grok-composer-2.5-fast", "owned_by": "xai", "display_name": "Composer Fast"}
+            ],
+            "claude": [
+                {"id": "claude-opus-5", "owned_by": "anthropic", "display_name": "Opus 5"}
+            ]
+        });
+        let cat = parse_official_models(&raw);
+        assert_eq!(cat.len(), 3);
+        let hits = search_official(&cat, "composer");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "grok-composer-2.5-fast");
+        let grok = backend_by_alias("grok").unwrap();
+        let map = default_tier_map(Some(grok), &cat);
+        assert_eq!(map.get("opus").map(String::as_str), Some("grok-4.6"));
+        assert_eq!(
+            map.get("haiku").map(String::as_str),
+            Some("grok-composer-2.5-fast")
+        );
+        assert!(!map.values().any(|v| v == "claude-opus-5"));
     }
 }

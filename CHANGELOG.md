@@ -16,9 +16,10 @@ All notable changes to this project are documented here. The format follows
   / `ensure` install the sidecar, import stored tokens, and keep the old tier→model map.
   First-party protocol translation is no longer the live path.
   `llmtrim sub on`, `/sub on`, and status tab 4 accept every CLIProxyAPI CLI
-  (codex, claude, gemini/antigravity, grok, kimi, vertex, qwen, copilot) plus live
-  model ids from the sidecar. (`LLMTRIM_CLIPROXY_URL` / `LLMTRIM_CLIPROXY_KEY` point
-  at an existing instance instead of the managed sidecar.)
+  (codex, claude, gemini/antigravity, grok, kimi, vertex, qwen, copilot). Status
+  tab 4 is mode (off / always / fallback) plus a searchable opus/sonnet/haiku/fable
+  → official CLIProxyAPI model map (`https://models.router-for.me/models.json`).
+  `sub on grok` writes that tier map; it does not pin every turn to one id.
 
 - **Grok flagship is `grok-4.6`.** Default Grok tier preset maps Opus/Sonnet/Fable to
   `grok-4.6` (replacing `grok-4.5`); Haiku stays on `grok-composer-2.5-fast`. The subscription

@@ -808,12 +808,12 @@ fn read_stdin() -> Result<String> {
 /// or a model id is pinned for this window.
 #[cfg(feature = "intercept")]
 fn window_sub_provider(requested: Option<&str>) -> Result<String> {
-    use llmtrim::reroute::cliproxy::{PinRequest, parse_pin_request, resolve_pin_live};
+    use llmtrim::reroute::cliproxy::{PinRequest, parse_pin_request};
     match requested {
         None => Ok("on".into()),
         Some(raw) => match parse_pin_request(raw) {
             Some(PinRequest::Enable) => Ok("on".into()),
-            Some(PinRequest::Pin(pin)) => Ok(resolve_pin_live(&pin).unwrap_or(pin)),
+            Some(PinRequest::Pin(pin)) => Ok(pin),
             None => bail!(
                 "usage: /sub on [codex|claude|gemini|grok|kimi|vertex|qwen|copilot|model-id] | off | status"
             ),
@@ -1239,10 +1239,29 @@ fn run_sub(action: SubCmd) -> Result<()> {
                         llmtrim_core::config::write_sub_model(None)?;
                     }
                     Some(llmtrim::reroute::cliproxy::PinRequest::Pin(pin)) => {
-                        let wire = llmtrim::reroute::cliproxy::resolve_pin_live(&pin)
-                            .unwrap_or_else(|| pin.clone());
-                        llmtrim_core::config::write_sub_model(Some(&wire))?;
-                        println!("Pinned: {wire}.");
+                        llmtrim_core::config::write_sub_model(None)?;
+                        let catalog = llmtrim::reroute::cliproxy::official_models();
+                        let map = if let Some(backend) =
+                            llmtrim::reroute::cliproxy::backend_by_alias(&pin)
+                        {
+                            llmtrim::reroute::cliproxy::default_tier_map(Some(backend), &catalog)
+                        } else {
+                            let mut map = std::collections::BTreeMap::new();
+                            for t in llmtrim::reroute::Tier::ALL {
+                                map.insert(t.as_str().to_string(), pin.clone());
+                            }
+                            map
+                        };
+                        if map.is_empty() {
+                            anyhow::bail!(
+                                "no official CLIProxyAPI models matched '{pin}' — try `llmtrim sub models` or tab 4 search"
+                            );
+                        }
+                        llmtrim_core::config::write_sub_tiers("on", &map)?;
+                        println!("Tier map ({pin}):");
+                        for (k, v) in &map {
+                            println!("  {k:<7} → {v}");
+                        }
                     }
                     None => anyhow::bail!(
                         "unknown target '{raw}' (codex|claude|gemini|grok|kimi|vertex|qwen|copilot or a model id)"
