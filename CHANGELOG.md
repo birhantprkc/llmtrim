@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ensure` / `sub on` can install CLIProxyAPI again.** The sidecar download used
+  ureq's `read_to_vec()` (10 MiB default). Current CLIProxyAPI archives are ~20 MiB,
+  so `llmtrim ensure` warned `the response body is larger than request limit: 10485760`.
+  The install now streams the archive to disk (64 MiB cap), matching the tray download.
+
 ## [0.13.0] - 2026-08-16
 
 ### Changed

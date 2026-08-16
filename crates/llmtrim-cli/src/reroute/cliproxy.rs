@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use super::SubProvider;
@@ -911,6 +911,11 @@ pub fn install_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Bound so a runaway response cannot fill the disk. Must be above current
+/// CLIProxyAPI archives (~20 MiB); ureq `read_to_vec` defaults to 10 MiB and
+/// rejects them (`the response body is larger than request limit: 10485760`).
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
 fn download(url: &str, dest: &Path) -> Result<()> {
     let mut req = ureq::get(url)
         .config()
@@ -919,11 +924,15 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         .build();
     req = req.header("User-Agent", "llmtrim-cliproxy");
     let mut res = req.call().with_context(|| format!("download {url}"))?;
-    let bytes = res
-        .body_mut()
-        .read_to_vec()
-        .context("read CLIProxyAPI archive")?;
-    fs::write(dest, bytes).with_context(|| format!("write {}", dest.display()))?;
+    use std::io::Read;
+    // `as_reader()` is unlimited by default; `read_to_vec()` is not (10 MiB).
+    let mut reader = res.body_mut().as_reader();
+    let mut file = fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut limited = Read::take(&mut reader, MAX_ARCHIVE_BYTES);
+    let n = std::io::copy(&mut limited, &mut file).context("read CLIProxyAPI archive")?;
+    if n >= MAX_ARCHIVE_BYTES {
+        bail!("CLIProxyAPI archive exceeded 64 MiB size limit");
+    }
     Ok(())
 }
 
