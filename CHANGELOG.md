@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-16
+
 ### Fixed
 
 - **0.13 upgrade keeps the old `sub` map.** Status tab 4 and `sub = on` were
@@ -1660,7 +1662,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/fkiene/llmtrim/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/fkiene/llmtrim/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fkiene/llmtrim/compare/v0.12.6...v0.13.0
 [0.12.6]: https://github.com/fkiene/llmtrim/compare/v0.12.5...v0.12.6
