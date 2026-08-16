@@ -1,4 +1,4 @@
-//! Status TUI **Sub** tab — mode (off / always / fallback) + Claude-tier → CLIProxyAPI map.
+//! Status TUI **Sub** tab — mode (off / always / fallback) + Claude → CLIProxyAPI map.
 
 use std::collections::BTreeMap;
 
@@ -41,18 +41,24 @@ enum Focus {
     Map,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Col {
+    From,
+    To,
+}
+
 pub struct SubPanel {
     focus: Focus,
     selected: RoutingPreset,
     applied: RoutingPreset,
     chain: Vec<String>,
-    tiers: [Tier; 4],
-    chosen: [String; 4],
+    rows: Vec<(String, String)>,
+    row: usize,
+    col: Col,
     catalog: Vec<OfficialModel>,
     search: String,
-    filtered: Vec<OfficialModel>,
+    filtered: Vec<String>,
     filter_idx: usize,
-    tier_row: usize,
     map_dirty: bool,
     running: bool,
     status: String,
@@ -73,13 +79,13 @@ impl SubPanel {
             selected: applied,
             applied,
             chain: Self::read_chain(),
-            tiers: Tier::ALL,
-            chosen: [String::new(), String::new(), String::new(), String::new()],
+            rows: Vec::new(),
+            row: 0,
+            col: Col::To,
             catalog: Vec::new(),
             search: String::new(),
             filtered: Vec::new(),
             filter_idx: 0,
-            tier_row: 0,
             map_dirty: false,
             running: false,
             status: String::new(),
@@ -88,6 +94,10 @@ impl SubPanel {
         panel.reload_catalog();
         panel.reload_map();
         panel
+    }
+
+    pub fn capturing_keys(&self) -> bool {
+        self.focus == Focus::Map
     }
 
     pub fn refresh(&mut self) {
@@ -106,19 +116,18 @@ impl SubPanel {
 
     pub fn preselect_provider(&mut self, _provider: SubProvider) {
         self.selected = RoutingPreset::Always;
-        self.status = "highlighted Always — Enter to apply · e to edit opus/sonnet/haiku/fable map"
-            .into();
+        self.status = "highlighted Always — Enter to apply · e to edit map".into();
     }
 
     pub fn seed_export_demo(&mut self) {
         self.selected = RoutingPreset::Always;
         self.applied = RoutingPreset::Always;
         self.running = true;
-        self.chosen = [
-            "grok-4.6".into(),
-            "grok-4.6".into(),
-            "grok-4.6".into(),
-            "grok-composer-2.5-fast".into(),
+        self.rows = vec![
+            ("fable".into(), "grok-4.6".into()),
+            ("opus".into(), "grok-4.6".into()),
+            ("sonnet".into(), "grok-4.6".into()),
+            ("haiku".into(), "grok-composer-2.5-fast".into()),
         ];
         self.status = "demo".into();
     }
@@ -143,21 +152,66 @@ impl SubPanel {
 
     fn reload_map(&mut self) {
         let overrides = llmtrim_core::config::sub_tiers_for("on");
-        for (i, t) in self.tiers.iter().enumerate() {
-            self.chosen[i] = overrides.get(t.as_str()).cloned().unwrap_or_default();
+        let mut rows: Vec<(String, String)> = overrides.into_iter().collect();
+        if rows.is_empty() {
+            rows = Tier::ALL
+                .iter()
+                .map(|t| (t.as_str().to_string(), String::new()))
+                .collect();
+        }
+        self.rows = rows;
+        if self.row >= self.rows.len() {
+            self.row = self.rows.len().saturating_sub(1);
         }
         self.map_dirty = false;
+        self.search.clear();
         self.refilter();
     }
 
+    fn input_suggestions(&self) -> Vec<String> {
+        let mut out: Vec<String> = Tier::ALL.iter().map(|t| t.as_str().to_string()).collect();
+        for m in &self.catalog {
+            if !out.iter().any(|x| x == &m.id) {
+                out.push(m.id.clone());
+            }
+        }
+        out
+    }
+
     fn refilter(&mut self) {
-        self.filtered = cliproxy::search_official(&self.catalog, &self.search);
+        let q = self.search.trim().to_ascii_lowercase();
+        let pool = match self.col {
+            Col::From => self.input_suggestions(),
+            Col::To => self
+                .catalog
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+        };
+        self.filtered = if q.is_empty() {
+            pool
+        } else {
+            pool.into_iter()
+                .filter(|id| {
+                    id.to_ascii_lowercase().contains(&q)
+                        || self.catalog.iter().any(|m| {
+                            m.id == *id
+                                && (m.display_name.to_ascii_lowercase().contains(&q)
+                                    || m.family.to_ascii_lowercase().contains(&q)
+                                    || m.owned_by.to_ascii_lowercase().contains(&q))
+                        })
+                })
+                .collect()
+        };
+        let current = self.rows.get(self.row).map(|(f, t)| match self.col {
+            Col::From => f.as_str(),
+            Col::To => t.as_str(),
+        });
+        self.filter_idx = current
+            .and_then(|c| self.filtered.iter().position(|id| id == c))
+            .unwrap_or(0);
         if self.filter_idx >= self.filtered.len() {
             self.filter_idx = self.filtered.len().saturating_sub(1);
-        }
-        let current = self.chosen[self.tier_row].as_str();
-        if let Some(i) = self.filtered.iter().position(|m| m.id == current) {
-            self.filter_idx = i;
         }
     }
 
@@ -172,9 +226,12 @@ impl SubPanel {
                 KeyCode::Enter => self.apply_selected(),
                 KeyCode::Char('e') => {
                     self.focus = Focus::Map;
+                    self.col = Col::To;
+                    self.search.clear();
                     self.refilter();
-                    self.status = "type to search official CLIProxyAPI models · ←→ pick · w save"
-                        .into();
+                    self.status =
+                        "← from  → to  ·  type to search  ·  +/- rows  ·  w save  ·  Esc"
+                            .into();
                 }
                 KeyCode::Char('r') => {
                     self.reload_catalog();
@@ -185,45 +242,108 @@ impl SubPanel {
             },
             Focus::Map => match code {
                 KeyCode::Esc => {
-                    if self.map_dirty {
+                    if !self.search.is_empty() {
+                        self.search.clear();
+                        self.refilter();
+                    } else if self.map_dirty {
                         self.reload_map();
                         self.status = "unsaved map changes discarded".into();
+                        self.focus = Focus::Presets;
+                    } else {
+                        self.focus = Focus::Presets;
                     }
+                }
+                KeyCode::Left => {
+                    self.col = Col::From;
                     self.search.clear();
-                    self.focus = Focus::Presets;
+                    self.refilter();
+                    self.status = "editing input (Claude tier or model id)".into();
                 }
-                KeyCode::Up | KeyCode::Char('k') if self.search.is_empty() => {
-                    if self.tier_row > 0 {
-                        self.tier_row -= 1;
-                        self.refilter();
-                    }
+                KeyCode::Right => {
+                    self.col = Col::To;
+                    self.search.clear();
+                    self.refilter();
+                    self.status = "editing output (CLIProxyAPI model)".into();
                 }
-                KeyCode::Down | KeyCode::Char('j') if self.search.is_empty() => {
-                    if self.tier_row + 1 < self.tiers.len() {
-                        self.tier_row += 1;
-                        self.refilter();
-                    }
-                }
-                KeyCode::Left => self.cycle_model(-1),
-                KeyCode::Right => self.cycle_model(1),
-                KeyCode::Char('w') => self.save_map(),
+                KeyCode::Up => self.move_row(-1),
+                KeyCode::Down => self.move_row(1),
+                KeyCode::Char('+') | KeyCode::Insert => self.add_row(),
+                KeyCode::Char('-') | KeyCode::Delete => self.remove_row(),
+                KeyCode::Char('w') if self.search.is_empty() => self.save_map(),
                 KeyCode::Backspace => {
                     self.search.pop();
-                    self.refilter();
+                    self.apply_search_to_cell();
+                }
+                KeyCode::Enter => {
+                    if let Some(id) = self.filtered.get(self.filter_idx).cloned() {
+                        self.set_cell(id);
+                        self.search.clear();
+                        self.refilter();
+                    }
                 }
                 KeyCode::Char(c) if !c.is_control() => {
                     self.search.push(c);
-                    self.refilter();
-                    if let Some(m) = self.filtered.first() {
-                        self.filter_idx = 0;
-                        self.chosen[self.tier_row] = m.id.clone();
-                        self.map_dirty = true;
-                    }
+                    self.apply_search_to_cell();
                 }
                 _ => return false,
             },
         }
         true
+    }
+
+    fn move_row(&mut self, dir: i32) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let n = self.rows.len() as i32;
+        self.row = (self.row as i32 + dir).rem_euclid(n) as usize;
+        self.search.clear();
+        self.refilter();
+    }
+
+    fn add_row(&mut self) {
+        self.rows.push((String::new(), String::new()));
+        self.row = self.rows.len() - 1;
+        self.col = Col::From;
+        self.search.clear();
+        self.map_dirty = true;
+        self.refilter();
+        self.status = "new row — type the input model".into();
+    }
+
+    fn remove_row(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.rows.remove(self.row);
+        if self.row >= self.rows.len() {
+            self.row = self.rows.len().saturating_sub(1);
+        }
+        self.map_dirty = true;
+        self.search.clear();
+        self.refilter();
+        self.status = "row removed".into();
+    }
+
+    fn set_cell(&mut self, value: String) {
+        if let Some(row) = self.rows.get_mut(self.row) {
+            match self.col {
+                Col::From => row.0 = value,
+                Col::To => row.1 = value,
+            }
+            self.map_dirty = true;
+        }
+    }
+
+    fn apply_search_to_cell(&mut self) {
+        self.refilter();
+        let value = self
+            .filtered
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.search.clone());
+        self.filter_idx = 0;
+        self.set_cell(value);
     }
 
     fn cycle_preset(&mut self, dir: i32) {
@@ -232,16 +352,6 @@ impl SubPanel {
         let next = (pos + dir).rem_euclid(list.len() as i32) as usize;
         self.selected = list[next];
         self.status.clear();
-    }
-
-    fn cycle_model(&mut self, dir: i32) {
-        if self.filtered.is_empty() {
-            return;
-        }
-        let n = self.filtered.len() as i32;
-        self.filter_idx = (self.filter_idx as i32 + dir).rem_euclid(n) as usize;
-        self.chosen[self.tier_row] = self.filtered[self.filter_idx].id.clone();
-        self.map_dirty = true;
     }
 
     fn read_chain() -> Vec<String> {
@@ -322,16 +432,18 @@ impl SubPanel {
 
     fn save_map(&mut self) {
         let mut map = BTreeMap::new();
-        for (t, m) in self.tiers.iter().zip(self.chosen.iter()) {
-            if !m.is_empty() {
-                map.insert(t.as_str().to_string(), m.clone());
+        for (from, to) in &self.rows {
+            let from = from.trim();
+            let to = to.trim();
+            if !from.is_empty() && !to.is_empty() {
+                map.insert(from.to_string(), to.to_string());
             }
         }
         match llmtrim_core::config::write_sub_tiers("on", &map) {
             Ok(()) => {
                 self.map_dirty = false;
                 self.needs_apply = true;
-                self.status = "tier map saved".into();
+                self.status = format!("saved {} mappings", map.len());
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
@@ -339,8 +451,8 @@ impl SubPanel {
 
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
-            Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · ⏎ apply · e map · r refresh · q",
-            Focus::Map => " ↑↓ tier · type search · ←→ model · w save · Esc back · q",
+            Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q",
+            Focus::Map => " ← from · → to · ↑↓ row · type search · +/- row · w save · Esc",
         }
     }
 
@@ -379,7 +491,11 @@ impl SubPanel {
                 ]
             })
             .collect();
-        let sidecar = if self.running { "sidecar up" } else { "sidecar down" };
+        let sidecar = if self.running {
+            "sidecar up"
+        } else {
+            "sidecar down"
+        };
         let header = Paragraph::new(vec![
             Line::from(presets),
             Line::from(format!(
@@ -387,7 +503,14 @@ impl SubPanel {
                 self.catalog.len()
             )),
             Line::from(if self.selected == RoutingPreset::Fallback {
-                format!("chain {}", if self.chain.is_empty() { "anthropic → on".into() } else { self.chain.join(" → ") })
+                format!(
+                    "chain {}",
+                    if self.chain.is_empty() {
+                        "anthropic → on".into()
+                    } else {
+                        self.chain.join(" → ")
+                    }
+                )
             } else {
                 String::new()
             }),
@@ -395,36 +518,56 @@ impl SubPanel {
         f.render_widget(header, chunks[0]);
 
         let rows: Vec<Row> = self
-            .tiers
+            .rows
             .iter()
-            .zip(self.chosen.iter())
             .enumerate()
-            .map(|(i, (t, m))| {
-                let style = if self.focus == Focus::Map && i == self.tier_row {
+            .map(|(i, (from, to))| {
+                let active = self.focus == Focus::Map && i == self.row;
+                let from_s = if from.is_empty() { "…" } else { from.as_str() };
+                let to_s = if to.is_empty() {
+                    "(pass through)"
+                } else {
+                    to.as_str()
+                };
+                let from_style = if active && self.col == Col::From {
                     Style::default()
                         .fg(palette::accent())
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if active {
+                    Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                let label = if m.is_empty() {
-                    "(pass through)".to_string()
+                let to_style = if active && self.col == Col::To {
+                    Style::default()
+                        .fg(palette::accent())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if active {
+                    Style::default().add_modifier(Modifier::BOLD)
                 } else {
-                    m.clone()
+                    Style::default()
                 };
-                Row::new(vec![t.as_str().to_string(), label]).style(style)
+                Row::new(vec![
+                    ratatui::widgets::Cell::from(from_s.to_string()).style(from_style),
+                    ratatui::widgets::Cell::from(to_s.to_string()).style(to_style),
+                ])
             })
             .collect();
-        let table = Table::new(rows, [Constraint::Length(10), Constraint::Min(20)]).header(
-            Row::new(vec!["claude", "CLIProxyAPI model"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        );
+        let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+            .header(
+                Row::new(vec!["input (Claude)", "output (CLIProxyAPI)"])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            );
         f.render_widget(table, chunks[1]);
 
         let hint = if self.focus == Focus::Map {
             let n = self.filtered.len();
+            let side = match self.col {
+                Col::From => "from",
+                Col::To => "to",
+            };
             format!(
-                "search: {}  ·  {n} hits  ·  {}",
+                "{side} search: {}  ·  {n} hits  ·  {}",
                 if self.search.is_empty() {
                     "_"
                 } else {
@@ -555,6 +698,6 @@ mod tests {
     fn new_panel_starts_on_presets() {
         let p = SubPanel::new();
         assert!(!p.needs_apply);
-        assert_eq!(p.focus, Focus::Presets);
+        assert!(!p.capturing_keys());
     }
 }

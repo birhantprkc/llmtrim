@@ -513,6 +513,15 @@ impl App {
             self.show_help = false;
             return false;
         }
+        // Map editor owns letters (including q) and ←/→ so search/column focus work.
+        #[cfg(feature = "intercept")]
+        if self.tab == Tab::Sub && self.sub.capturing_keys() {
+            let _ = self.sub.handle_key(code);
+            if self.sub.needs_apply {
+                self.pending_sub_apply = true;
+            }
+            return false;
+        }
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('?') => self.show_help = true,
