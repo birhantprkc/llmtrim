@@ -19,7 +19,7 @@
   <sub>
     Using <b>Claude Code</b>? One install also gets you a live <a href="#claude-code">status line</a>,
     a <a href="#claude-code">cold-cache guard</a>, cheaper <a href="#claude-code"><code>/compact</code></a>,
-    and <a href="#claude-code"><code>/sub</code></a> to serve it from a Codex / Kimi / SuperGrok plan.
+    and <a href="#claude-code"><code>/sub</code></a> to serve it through CLIProxyAPI.
   </sub>
 </p>
 
@@ -308,19 +308,25 @@ The redirect only fires once the prompt cache has gone cold. `/compact` re-sends
 <details>
 <summary><b>Subscription reroute (`sub`)</b> (opt-in; may conflict with provider ToS)</summary>
 
-Serve Claude Code from a ChatGPT/Codex, Kimi, or SuperGrok plan instead of Anthropic, or as fallback when Anthropic fails. Login prints a warning; decide for yourself.
+Send Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) instead of Anthropic, or as a fallback hop when the current path fails. Login is CLIProxyAPI's TUI; decide for yourself whether that fits the provider ToS.
 
 ```bash
-llmtrim sub auth codex login    # or kimi / grok
-llmtrim sub on codex            # or kimi / grok
+llmtrim sub on                  # install + start CLIProxyAPI, enable redirect
+llmtrim sub on grok             # write opus/sonnet/haiku/fable → that CLI's models
+llmtrim sub auth                # CLIProxyAPI TUI — sign in
+llmtrim sub models              # official + live sidecar models
+llmtrim sub map on opus grok-4.6
+llmtrim sub chain anthropic,codex
+llmtrim sub mode fallback       # try hops in order when the current one fails
 llmtrim sub status
-llmtrim sub mode fallback       # only when Anthropic fails
-llmtrim sub chain codex,kimi,grok
 llmtrim sub off
 ```
 
-Interactive: `llmtrim status` → tab **4 Sub** (or `llmtrim sub setup`) — cycle routing
-presets with ←/→, Enter to apply, `e` to edit the tier→model map.
+Interactive: `llmtrim status` → tab **4 Sub** — Off / Always / Fallback, then `e` to edit the
+input→output map (type to search [CLIProxyAPI's catalog](https://models.router-for.me/models.json);
+`s` save, `a` add, `d` delete). `[` `]` rotate the fallback first hop.
+`llmtrim update` also updates CLIProxyAPI when you use it. Point `LLMTRIM_CLIPROXY_URL` at an
+existing instance to skip the managed sidecar.
 
 Route only a delegated Claude Code subagent while leaving the parent window unchanged:
 
@@ -337,18 +343,20 @@ agent files and records an opt-out so `ensure` leaves them removed.
 This window only (installed with ensure; includes subagents; survives `/clear`):
 
 ```text
-/sub on [optional:codex|kimi|grok]   # bare /sub on = last window provider or global sub
+/sub on [optional:cli-or-model]  # gemini, codex, claude, grok, kimi, vertex, qwen, copilot, or a model id
 /sub off
 /sub status
 ```
 
-Tokens: `~/.llmtrim/<provider>/auth.json` (mode 0600). Env: `LLMTRIM_SUB`, `LLMTRIM_SUB_MODE`, `LLMTRIM_SUB_CHAIN`.
+Sidecar: `~/.llmtrim/cliproxy/` (binary + config). Auth: `~/.cli-proxy-api` when present, else
+`~/.llmtrim/cliproxy/auth`. Env: `LLMTRIM_SUB`, `LLMTRIM_SUB_MODE`, `LLMTRIM_CLIPROXY_URL`,
+`LLMTRIM_CLIPROXY_KEY`.
 
 **Anthropic `/login` vs claude.ai connectors:** with global `sub` in `always` mode, by
 default llmtrim writes a dummy `ANTHROPIC_AUTH_TOKEN` into `~/.claude/settings.json` (same
 idea as [claude-code-proxy](https://github.com/raine/claude-code-proxy)'s
 `ANTHROPIC_AUTH_TOKEN=unused`) so Claude Code does not need a live Anthropic OAuth session.
-The MITM strips that dummy token and injects the real Grok/Codex/Kimi credential; non-messages
+The MITM strips that dummy token and sends `/v1/messages` to CLIProxyAPI; non-messages
 Anthropic probes are answered locally so they never return `401 Invalid bearer token`.
 
 Claude Code treats any API-key auth as overriding claude.ai login, so **claude.ai connectors
@@ -361,8 +369,8 @@ llmtrim sub anthropic-login skip   # default: no Anthropic /login; connectors of
 ```
 
 Restart Claude Code after `sub on` / `sub off` / `sub mode` / `sub anthropic-login` for the
-settings change to take effect. `sub mode fallback` always needs a real Anthropic login (the
-primary path is Anthropic).
+settings change to take effect. Fallback whose first hop is "what's in use" still needs a real
+Anthropic login.
 
 </details>
 

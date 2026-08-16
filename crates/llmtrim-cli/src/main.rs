@@ -51,7 +51,7 @@ Get started:
   update     Update to the latest release and refresh integrations
   ensure     Bring this machine to the recommended current state
   wrap       Launch an agent (claude, codex, …) routed through the interceptor
-  sub        Reroute Claude Code to another subscription's backend (codex|kimi|grok)
+  sub        Reroute Claude Code through CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI)
   agents     Install routed Claude Code subagents (Grok, Codex/Terra, Kimi)
   tray       Open the desktop tray app (savings menu-bar / system-tray)
 
@@ -114,11 +114,10 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// Subscription reroute: use another subscription's backend for Claude Code
+    /// Subscription reroute: send Claude Code traffic through CLIProxyAPI
     ///
-    /// With `sub` enabled, intercepted Anthropic traffic is translated and sent to your
-    /// ChatGPT (codex) or Kimi subscription instead of Anthropic. Authenticate first with
-    /// `llmtrim sub auth codex login` / `llmtrim sub auth kimi login` / `llmtrim sub auth grok login`.
+    /// `sub on` installs/starts CLIProxyAPI and rewrites intercepted Anthropic traffic to it.
+    /// Sign in with `llmtrim sub auth` (CLIProxyAPI TUI). `sub models` lists what it can serve.
     Sub {
         #[command(subcommand)]
         action: SubCmd,
@@ -473,24 +472,25 @@ enum AgentsCmd {
 /// Subscription reroute: send Claude Code traffic to another subscription's backend.
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Open the interactive tier→model mapping editor for a provider (codex|kimi|grok).
+    /// Open tab 4 of `llmtrim status` to edit the input→output model map.
     Setup {
-        /// Provider to edit: codex|kimi|grok.
+        /// Ignored (kept so old `sub setup grok` still opens the map). Any CLIProxyAPI CLI is fine.
+        #[arg(default_value = "on")]
         provider: String,
     },
-    /// Enable reroute to a provider (writes `sub = <provider>` to the config).
+    /// Enable reroute through CLIProxyAPI (installs + starts the sidecar).
     ///
-    /// Omit the provider to re-enable the last provider you used. `sub use` and `sub start`
-    /// are accepted aliases.
+    /// An optional CLIProxyAPI CLI (`gemini`, `codex`, …) or model id pins every turn.
+    /// `sub use` and `sub start` are accepted aliases.
     #[command(visible_alias = "use", alias = "start")]
     On {
-        /// Provider to route to: codex|kimi|grok. Omit to re-enable the last provider used.
+        /// Optional CLI (`gemini`, `codex`, …) or model id. Writes the input→output map.
         provider: Option<String>,
         /// Don't restart a running interceptor to apply the change (just print the hint).
         #[arg(long)]
         no_restart: bool,
     },
-    /// Disable reroute (sets `sub = off`); traffic goes back to Anthropic with compression only.
+    /// Disable reroute (`sub = off`); traffic stays on what's in use, compression only.
     ///
     /// `sub stop` is an accepted alias.
     #[command(alias = "stop")]
@@ -499,8 +499,8 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Set the reroute mode: `always` (reroute every turn) or `fallback` (use the ordered
-    /// subscription chain only when Anthropic cannot serve the turn).
+    /// Set the reroute mode: `always` (every turn uses the map) or `fallback` (try hops
+    /// in `sub chain` order when the current hop cannot serve the turn).
     Mode {
         /// `always` or `fallback`.
         mode: String,
@@ -508,16 +508,15 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Set the ordered providers used by `sub mode fallback` (for example `codex,kimi,grok`).
+    /// Set the fallback hop list (for example `anthropic,codex` or `gemini,anthropic`).
     Chain {
-        /// Comma-separated providers in try order: codex,kimi,grok.
+        /// Comma-separated hops: anthropic,codex,claude,gemini,grok,kimi,vertex,qwen,copilot.
         providers: String,
         /// Don't restart a running interceptor to apply the change.
         #[arg(long)]
         no_restart: bool,
     },
-    /// Override the Codex reasoning effort on every rerouted request. By default the reroute honors
-    /// the effort Claude Code asks for per turn; this forces one level instead (Kimi ignores it).
+    /// Override reasoning effort on rerouted requests. Default: honor what Claude Code asks.
     Effort {
         /// `none` | `low` | `medium` | `high` | `xhigh` (`max` = `xhigh`).
         level: String,
@@ -525,10 +524,10 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Map one incoming model (a Claude tier `opus|sonnet|haiku|fable`, or an exact model id) to a
-    /// provider model. Non-interactive form of `setup`, for scripts and the tray.
+    /// Map one incoming model (tier `opus|sonnet|haiku|fable`, or an exact id) to a
+    /// CLIProxyAPI model. Non-interactive form of `setup`.
     Map {
-        /// Provider whose mapping to edit: codex|kimi|grok.
+        /// Map key: `on` (live map) or a legacy name. Prefer `on`.
         provider: String,
         /// Incoming model or tier name to map from.
         from: String,
@@ -538,9 +537,9 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Remove one mapping entry (falls back to the preset default for that model).
+    /// Remove one mapping entry from the live map.
     Unmap {
-        /// Provider whose mapping to edit: codex|kimi|grok.
+        /// Map key: `on` (live map) or a legacy name. Prefer `on`.
         provider: String,
         /// Incoming model or tier name to unmap.
         from: String,
@@ -548,9 +547,9 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// List the provider's candidate models (for autocompletion). `--json` for machine output.
+    /// List CLIProxyAPI models (live sidecar, else the official catalog). `--json` for machines.
     Models {
-        /// Provider: codex|kimi|grok.
+        /// Unused; kept so `sub models grok` still lists the sidecar.
         provider: String,
         /// Emit a JSON array of model ids.
         #[arg(long)]
@@ -562,9 +561,9 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sign in / out of a subscription (`llmtrim sub auth codex login`).
+    /// Open the CLIProxyAPI TUI to sign in (`llmtrim sub auth`).
     Auth {
-        /// Provider: codex|kimi|grok.
+        /// Unused; sign-in is the sidecar TUI.
         provider: String,
         #[command(subcommand)]
         action: AuthAction,
@@ -804,41 +803,22 @@ fn read_stdin() -> Result<String> {
     Ok(buf)
 }
 
-/// Resolve which subscription backend a window `/sub on [provider]` should use, and require it
-/// to be signed in. With an explicit name (`/sub on grok`), only that provider is considered.
-/// Without one (`/sub on`), fall back to the global/last-enabled `sub` config.
+/// Resolve which label a window `/sub on [backend|model]` should store.
+/// Bare `/sub on` enables CLIProxyAPI. A CLIProxyAPI CLI name (`gemini`, `codex`, …)
+/// or a model id is pinned for this window.
 #[cfg(feature = "intercept")]
 fn window_sub_provider(requested: Option<&str>) -> Result<String> {
-    use llmtrim::reroute::SubProvider;
-    let configured = match requested {
-        Some(raw) => {
-            let p = SubProvider::parse(raw).ok_or_else(|| {
-                anyhow::anyhow!("unknown provider '{raw}' (codex|kimi|grok)")
-            })?;
-            p.as_str().to_string()
-        }
-        None => llmtrim_core::config::RuntimeConfig::get()
-            .sub
-            .clone()
-            .or_else(llmtrim_core::config::sub_reenable_provider)
-            .context(
-                "no provider to re-enable — pass one (`/sub on grok`) or run `llmtrim sub on codex|kimi|grok` first",
-            )?,
-    };
-    let provider =
-        SubProvider::parse(&configured).context("configured subscription provider is invalid")?;
-    let logged_in = llmtrim::reroute::auth::auth_status_json(provider)
-        .get("logged_in")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !logged_in {
-        bail!(
-            "{} is not signed in — run `llmtrim sub auth {} login` first",
-            provider.as_str(),
-            provider.as_str()
-        );
+    use llmtrim::reroute::cliproxy::{PinRequest, parse_pin_request};
+    match requested {
+        None => Ok("on".into()),
+        Some(raw) => match parse_pin_request(raw) {
+            Some(PinRequest::Enable) => Ok("on".into()),
+            Some(PinRequest::Pin(pin)) => Ok(pin),
+            None => bail!(
+                "usage: /sub on [codex|claude|gemini|grok|kimi|vertex|qwen|copilot|model-id] | off | status"
+            ),
+        },
     }
-    Ok(provider.as_str().to_string())
 }
 
 #[cfg(not(feature = "intercept"))]
@@ -945,7 +925,9 @@ fn run_window_sub(args: Vec<String>) -> Result<()> {
                     }
                     None => println!("This window follows the global subscription policy."),
                 },
-                _ => bail!("usage: /sub on [codex|kimi|grok] | off | status"),
+                _ => bail!(
+                    "usage: /sub on [codex|claude|gemini|grok|kimi|vertex|qwen|copilot|model-id] | off | status"
+                ),
             }
         }
         _ => bail!("unknown window-sub action"),
@@ -962,6 +944,7 @@ fn main() {
 
 /// Handle `llmtrim <codex|kimi|grok> auth <action>`.
 #[cfg(feature = "intercept")]
+#[allow(dead_code)] // first-party OAuth kept; live `sub auth` opens CLIProxyAPI TUI
 fn run_auth(provider: &str, action: AuthAction) -> Result<()> {
     use llmtrim::reroute::{SubProvider, auth};
     // `auth status --json` is provider-agnostic (reads the stored credential file).
@@ -996,6 +979,7 @@ fn run_auth(provider: &str, action: AuthAction) -> Result<()> {
 /// whether a token is present: when it isn't, the caller skips the daemon restart (routing can't
 /// work until sign-in, so applying it now is pointless).
 #[cfg(feature = "intercept")]
+#[allow(dead_code)] // first-party login nudge; live `sub on` starts CLIProxyAPI instead
 fn print_reroute_enabled(p: llmtrim::reroute::SubProvider) -> bool {
     let logged_in =
         llmtrim::reroute::auth::auth_status_json(p)["logged_in"].as_bool() == Some(true);
@@ -1051,6 +1035,11 @@ fn sync_claude_sub_auth() {
 /// up the new config on its own). Also reconciles the Claude Code dummy-auth env for always-on sub.
 #[cfg(feature = "intercept")]
 fn apply_sub_change(no_restart: bool) {
+    if llmtrim_core::config::sub_always_on()
+        && let Err(e) = llmtrim::reroute::cliproxy::ensure_running()
+    {
+        eprintln!("llmtrim: CLIProxyAPI: {e:#}");
+    }
     // Always reconcile Claude settings, even when the daemon isn't running / no_restart —
     // the auth env is independent of the interceptor process.
     sync_claude_sub_auth();
@@ -1077,12 +1066,8 @@ fn apply_sub_change(no_restart: bool) {
 /// the provider reroute is currently pointed at — a change to some other provider's mapping is
 /// inert until you switch to it, so there's no reason to disturb a live session.
 #[cfg(feature = "intercept")]
-fn apply_sub_map_change(edited: llmtrim::reroute::SubProvider, no_restart: bool) {
-    let active = llmtrim_core::config::RuntimeConfig::get()
-        .sub
-        .as_deref()
-        .and_then(llmtrim::reroute::SubProvider::parse);
-    if active == Some(edited) {
+fn apply_sub_map_change(no_restart: bool) {
+    if llmtrim_core::config::sub_always_on() {
         apply_sub_change(no_restart);
     }
 }
@@ -1198,35 +1183,43 @@ fn run_agents(action: AgentsCmd) -> Result<()> {
 #[cfg(feature = "intercept")]
 fn run_sub(action: SubCmd) -> Result<()> {
     use llmtrim::reroute::{SubProvider, Tier, default_codex_tier_model};
-    let parse = |p: &str| {
+    let parse = |p: &str| -> anyhow::Result<String> {
+        let p = p.trim();
+        if p.is_empty()
+            || llmtrim::reroute::cliproxy::is_passthrough_label(p)
+            || llmtrim::reroute::cliproxy::parse_hop(p).is_some()
+        {
+            return Ok("on".into());
+        }
         SubProvider::parse(p)
-            .ok_or_else(|| anyhow::anyhow!("unknown provider '{p}' (codex|kimi|grok)"))
+            .map(|x| x.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown target '{p}' (on|anthropic|codex|claude|gemini|grok|kimi|vertex|qwen|copilot)"
+                )
+            })
     };
     match action {
-        SubCmd::Setup { provider } => {
-            let p = parse(&provider)?;
-            // The interactive editor lives in `llmtrim status` tab 4 (Sub). Prefer that
-            // surface so mode + provider routing share one TUI; keep the standalone
-            // mapping editor as a fallback when status isn't available.
+        SubCmd::Setup { provider: _ } => {
+            // The interactive editor lives in `llmtrim status` tab 4 (Sub).
             #[cfg(all(feature = "breakdown", feature = "intercept"))]
             {
                 use std::io::IsTerminal;
                 if std::io::stdout().is_terminal() {
-                    llmtrim::breakdown::app::open_on_sub_next(Some(p));
+                    llmtrim::breakdown::app::open_on_sub_next(None);
                     // Same live dashboard as `llmtrim status`, focused on the Sub tab
                     // with the named provider highlighted (Enter applies).
                     return run_monitor(2, false, false, false, false, false, false, false);
                 }
                 // Non-TTY: fall through to the headless mapping editor.
-                llmtrim::reroute::tui::run(p)
+                llmtrim::reroute::tui::run(SubProvider::CliProxy)
             }
             #[cfg(all(feature = "breakdown", not(feature = "intercept")))]
             {
-                llmtrim::reroute::tui::run(p)
+                llmtrim::reroute::tui::run(SubProvider::CliProxy)
             }
             #[cfg(not(feature = "breakdown"))]
             {
-                let _ = p;
                 anyhow::bail!("the mapping editor needs the `breakdown` feature")
             }
         }
@@ -1234,58 +1227,62 @@ fn run_sub(action: SubCmd) -> Result<()> {
             provider,
             no_restart,
         } => {
-            let logged_in = match provider {
-                // Explicit provider: (re)write the default preset, as `use` always has.
-                Some(provider) => {
-                    let p = parse(&provider)?;
-                    let mut map = std::collections::BTreeMap::new();
-                    match p {
-                        SubProvider::Codex => {
-                            for t in Tier::ALL {
-                                map.insert(
-                                    t.as_str().to_string(),
-                                    default_codex_tier_model(t).to_string(),
-                                );
-                            }
-                        }
-                        SubProvider::Grok => {
-                            for t in Tier::ALL {
-                                map.insert(
-                                    t.as_str().to_string(),
-                                    llmtrim::reroute::default_grok_tier_model(t).to_string(),
-                                );
-                            }
-                        }
-                        SubProvider::Kimi => {}
-                        // SubProvider is non_exhaustive for semver; new backends need a map here.
-                        _ => {}
-                    }
-                    llmtrim_core::config::write_sub_mapping(p.as_str(), &map)?;
-                    print_reroute_enabled(p)
-                }
-                // Bare `sub on`: restore the last provider, keeping its saved mapping.
+            println!("Installing/starting CLIProxyAPI…");
+            llmtrim::reroute::cliproxy::ensure_running()?;
+            llmtrim_core::config::enable_sub("on")?;
+            match provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None => {
-                    let provider = llmtrim_core::config::sub_reenable_provider().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no provider to re-enable — run `llmtrim sub on codex` (or kimi|grok) first"
-                        )
-                    })?;
-                    let p = parse(&provider)?;
-                    llmtrim_core::config::enable_sub(p.as_str())?;
-                    print_reroute_enabled(p)
+                    llmtrim_core::config::write_sub_model(None)?;
                 }
-            };
-            // Claude auth-env sync always runs (independent of provider login). Daemon restart
-            // is still skipped when signed out — routing can't work until sign-in anyway.
-            if logged_in {
-                apply_sub_change(no_restart);
-            } else {
-                sync_claude_sub_auth();
+                Some(raw) => match llmtrim::reroute::cliproxy::parse_pin_request(raw) {
+                    Some(llmtrim::reroute::cliproxy::PinRequest::Enable) => {
+                        llmtrim_core::config::write_sub_model(None)?;
+                    }
+                    Some(llmtrim::reroute::cliproxy::PinRequest::Pin(pin)) => {
+                        llmtrim_core::config::write_sub_model(None)?;
+                        let catalog = llmtrim::reroute::cliproxy::official_models();
+                        let map = if let Some(backend) =
+                            llmtrim::reroute::cliproxy::backend_by_alias(&pin)
+                        {
+                            llmtrim::reroute::cliproxy::default_tier_map(Some(backend), &catalog)
+                        } else {
+                            let mut map = std::collections::BTreeMap::new();
+                            for t in llmtrim::reroute::Tier::ALL {
+                                map.insert(t.as_str().to_string(), pin.clone());
+                            }
+                            map
+                        };
+                        if map.is_empty() {
+                            anyhow::bail!(
+                                "no official CLIProxyAPI models matched '{pin}' — try `llmtrim sub models` or tab 4 search"
+                            );
+                        }
+                        llmtrim_core::config::write_sub_tiers("on", &map)?;
+                        println!("Tier map ({pin}):");
+                        for (k, v) in &map {
+                            println!("  {k:<7} → {v}");
+                        }
+                    }
+                    None => anyhow::bail!(
+                        "unknown target '{raw}' (codex|claude|gemini|grok|kimi|vertex|qwen|copilot or a model id)"
+                    ),
+                },
             }
+            println!(
+                "Reroute enabled via CLIProxyAPI at {}.",
+                llmtrim::reroute::cliproxy::base_url()
+            );
+            println!("Sign in: `llmtrim sub auth`  ·  models: `llmtrim sub models`");
+            apply_sub_change(no_restart);
             Ok(())
         }
         SubCmd::Off { no_restart } => {
             llmtrim_core::config::disable_sub()?;
+            match llmtrim::reroute::cliproxy::stop() {
+                Ok(Some(pid)) => println!("Stopped CLIProxyAPI (pid {pid})."),
+                Ok(None) => {}
+                Err(e) => eprintln!("llmtrim: could not stop CLIProxyAPI: {e:#}"),
+            }
             println!("Reroute disabled — traffic goes to Anthropic (compression only).");
             // Always sync Claude auth env even if not logged in earlier paths skipped restart.
             apply_sub_change(no_restart);
@@ -1317,13 +1314,17 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 if raw.is_empty() {
                     continue;
                 }
-                let p = parse(raw)?;
-                if !chain.contains(&p.as_str().to_string()) {
-                    chain.push(p.as_str().to_string());
+                let Some(hop) = llmtrim::reroute::cliproxy::parse_hop(raw) else {
+                    anyhow::bail!(
+                        "unknown hop '{raw}' (anthropic|codex|claude|gemini|grok|kimi|vertex|qwen|copilot)"
+                    );
+                };
+                if !chain.contains(&hop) {
+                    chain.push(hop);
                 }
             }
             if chain.is_empty() {
-                anyhow::bail!("fallback chain is empty (expected codex,kimi)");
+                anyhow::bail!("fallback chain is empty (e.g. anthropic,codex or codex,anthropic)");
             }
             llmtrim_core::config::write_sub_chain(&chain)?;
             println!("Fallback chain: {}.", chain.join(" -> "));
@@ -1359,10 +1360,10 @@ fn run_sub(action: SubCmd) -> Result<()> {
             to,
             no_restart,
         } => {
-            let p = parse(&provider)?;
-            llmtrim_core::config::write_sub_map_entry(p.as_str(), &from, &to)?;
-            println!("Mapped {from} -> {to} for {}.", p.as_str());
-            apply_sub_map_change(p, no_restart);
+            let key = parse(&provider)?;
+            llmtrim_core::config::write_sub_map_entry(&key, &from, &to)?;
+            println!("Mapped {from} -> {to}.");
+            apply_sub_map_change(no_restart);
             Ok(())
         }
         SubCmd::Unmap {
@@ -1370,26 +1371,42 @@ fn run_sub(action: SubCmd) -> Result<()> {
             from,
             no_restart,
         } => {
-            let p = parse(&provider)?;
-            llmtrim_core::config::remove_sub_map_entry(p.as_str(), &from)?;
-            println!(
-                "Unmapped {from} for {} (back to the preset default).",
-                p.as_str()
-            );
-            apply_sub_map_change(p, no_restart);
+            let key = parse(&provider)?;
+            llmtrim_core::config::remove_sub_map_entry(&key, &from)?;
+            println!("Unmapped {from}.");
+            apply_sub_map_change(no_restart);
             Ok(())
         }
-        SubCmd::Models { provider, json } => {
-            let p = parse(&provider)?;
-            let ids: Vec<String> = llmtrim::reroute::catalog::models_for(p)
-                .into_iter()
-                .map(|e| e.id)
-                .collect();
+        SubCmd::Models { json, .. } => {
+            let models = match llmtrim::reroute::cliproxy::list_models() {
+                Ok(m) if !m.is_empty() => m,
+                Ok(_) | Err(_) => llmtrim::reroute::cliproxy::official_models()
+                    .into_iter()
+                    .map(|m| llmtrim::reroute::cliproxy::Model {
+                        id: m.id,
+                        owned_by: m.owned_by,
+                    })
+                    .collect(),
+            };
             if json {
-                println!("{}", serde_json::to_string(&ids)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &models
+                            .iter()
+                            .map(|m| serde_json::json!({"id": m.id, "owned_by": m.owned_by}))
+                            .collect::<Vec<_>>()
+                    )?
+                );
+            } else if models.is_empty() {
+                println!("No models yet — run `llmtrim sub auth` to sign in.");
             } else {
-                for id in ids {
-                    println!("{id}");
+                for m in models {
+                    if m.owned_by.is_empty() {
+                        println!("{}", m.id);
+                    } else {
+                        println!("{}\t{}", m.id, m.owned_by);
+                    }
                 }
             }
             Ok(())
@@ -1401,30 +1418,7 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 // One effective map: the four resolved Codex tiers, then every configured entry
                 // laid over them (a configured tier wins, a free-form `model-id -> model` adds a
                 // row). One key, not a resolved/raw pair the caller has to reconcile.
-                let mut mapping: std::collections::BTreeMap<String, String> = match active {
-                    Some(SubProvider::Codex) => Tier::ALL
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.as_str().to_string(),
-                                default_codex_tier_model(*t).to_string(),
-                            )
-                        })
-                        .collect(),
-                    Some(SubProvider::Grok) => Tier::ALL
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.as_str().to_string(),
-                                llmtrim::reroute::default_grok_tier_model(*t).to_string(),
-                            )
-                        })
-                        .collect(),
-                    _ => std::collections::BTreeMap::new(),
-                };
-                for (k, v) in &cfg.sub_tiers {
-                    mapping.insert(k.clone(), v.clone());
-                }
+                let mapping = llmtrim_core::config::sub_tiers_for("on");
                 let skip_login = llmtrim_core::config::sub_skip_anthropic_login();
                 let claude_auth = match llmtrim::statusline::sub_auth_env_presence() {
                     llmtrim::statusline::SubAuthEnvPresence::Ours => "dummy",
@@ -1440,6 +1434,17 @@ fn run_sub(action: SubCmd) -> Result<()> {
                     "anthropic_login": if skip_login { "skip" } else { "keep" },
                     "claude_auth_token": claude_auth,
                     "mapping": mapping,
+                    "cliproxy": {
+                        "url": llmtrim::reroute::cliproxy::base_url(),
+                        "running": llmtrim::reroute::cliproxy::is_running(),
+                        "installed": llmtrim::reroute::cliproxy::is_installed(),
+                        "version": llmtrim::reroute::cliproxy::installed_version(),
+                        "models": llmtrim::reroute::cliproxy::list_models()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|m| m.id)
+                            .collect::<Vec<_>>(),
+                    },
                     "auth": {
                         "codex": llmtrim::reroute::auth::auth_status_json(SubProvider::Codex),
                         "kimi": llmtrim::reroute::auth::auth_status_json(SubProvider::Kimi),
@@ -1448,6 +1453,30 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
                 return Ok(());
+            }
+            let cp = llmtrim::reroute::cliproxy::status();
+            println!(
+                "CLIProxyAPI: {} ({}){}",
+                if cp.running { "running" } else { "stopped" },
+                cp.base_url,
+                cp.version
+                    .as_deref()
+                    .map(|v| format!(" v{v}"))
+                    .unwrap_or_default()
+            );
+            match llmtrim::reroute::cliproxy::list_models() {
+                Ok(models) if !models.is_empty() => {
+                    println!("Models:");
+                    for m in models {
+                        if m.owned_by.is_empty() {
+                            println!("  {}", m.id);
+                        } else {
+                            println!("  {} ({})", m.id, m.owned_by);
+                        }
+                    }
+                }
+                Ok(_) => println!("Models: none — run `llmtrim sub auth` to sign in."),
+                Err(e) => println!("Models: unavailable ({e})"),
             }
             match active {
                 None => println!("Reroute: off"),
@@ -1560,7 +1589,13 @@ fn run_sub(action: SubCmd) -> Result<()> {
             }
             Ok(())
         }
-        SubCmd::Auth { provider, action } => run_auth(&provider, action),
+        SubCmd::Auth { .. } => {
+            println!(
+                "Opening CLIProxyAPI TUI to sign in. Auth files: {}",
+                llmtrim::reroute::cliproxy::auth_dir().display()
+            );
+            llmtrim::reroute::cliproxy::auth_tui()
+        }
         SubCmd::AnthropicLogin { mode } => {
             let skip = match mode.trim().to_ascii_lowercase().as_str() {
                 "skip" | "dummy" | "none" => true,

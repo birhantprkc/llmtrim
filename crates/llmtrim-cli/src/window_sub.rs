@@ -66,7 +66,27 @@ fn valid(value: &str) -> bool {
         && !value.contains("..")
 }
 fn valid_provider(value: &str) -> bool {
-    matches!(value, "codex" | "kimi" | "grok")
+    #[cfg(feature = "intercept")]
+    {
+        crate::reroute::cliproxy::parse_pin_request(value).is_some()
+    }
+    #[cfg(not(feature = "intercept"))]
+    {
+        matches!(value, "codex" | "kimi" | "grok" | "on") || valid_model_id(value)
+    }
+}
+
+/// A CLIProxyAPI model id that `/sub on <id>` may pin for this window.
+pub fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+        && !value.contains("..")
+        && !value.eq_ignore_ascii_case("off")
+        && !value.eq_ignore_ascii_case("anthropic")
+        && (value.contains('-') || value.contains('/') || value.contains('.'))
 }
 
 pub fn registry_path() -> Result<PathBuf> {
@@ -1170,8 +1190,15 @@ mod tests {
         assert!(valid_provider("codex"));
         assert!(valid_provider("kimi"));
         assert!(valid_provider("grok"));
-        assert!(!valid_provider("anthropic"));
-        assert!(!valid_provider("openai"));
+        assert!(valid_provider("gemini"));
+        assert!(valid_provider("claude"));
+        assert!(valid_provider("antigravity"));
+        assert!(valid_provider("qwen"));
+        assert!(valid_provider("copilot"));
+        assert!(valid_provider("vertex"));
+        assert!(valid_provider("openai"));
+        assert!(valid_provider("anthropic"));
+        assert!(!valid_provider("notaprovider"));
     }
 
     #[test]

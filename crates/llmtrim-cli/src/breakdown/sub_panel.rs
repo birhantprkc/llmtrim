@@ -1,10 +1,4 @@
-//! Status TUI **Sub** tab — simple subscription routing.
-//!
-//! Level 1 (default): cycle a small set of **routing presets** with ←/→ and apply with Enter.
-//! Level 2 (opt-in via `e`): edit the active provider's Claude-tier → model map
-//! (Fable first, then Opus/Sonnet/Haiku).
-//!
-//! Chain order, effort, anthropic-login, window `/sub`, and OAuth stay on the CLI.
+//! Status TUI **Sub** tab — mode (off / always / fallback) + Claude → CLIProxyAPI map.
 
 use std::collections::BTreeMap;
 
@@ -12,27 +6,26 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
-
-use super::palette;
-use crate::reroute::catalog::{self, CatalogEntry};
-use crate::reroute::{
-    KIMI_MODEL, SubProvider, Tier, default_codex_tier_model, default_grok_tier_model,
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Row, Table,
 };
 
-/// One selectable routing policy. Provider and mode are packaged so the user never has to
-/// juggle "active" vs "edit" vs "mode" as separate dials on the default surface.
+use super::palette;
+use crate::reroute::cliproxy::{self, OfficialModel};
+use crate::reroute::{SubProvider, Tier};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingPreset {
     Off,
     AlwaysCodex,
     AlwaysKimi,
     AlwaysGrok,
-    /// Anthropic first; on failure, try the saved chain (or the last/active provider).
+    /// What's in use first; on failure, try the saved hop chain.
     Fallback,
 }
 
 impl RoutingPreset {
+    /// Public list kept at 5 variants for semver. The TUI cycles Off / Always / Fallback.
     pub const ALL: [RoutingPreset; 5] = [
         RoutingPreset::Off,
         RoutingPreset::AlwaysCodex,
@@ -41,242 +34,422 @@ impl RoutingPreset {
         RoutingPreset::Fallback,
     ];
 
+    const CYCLE: [RoutingPreset; 3] = [
+        RoutingPreset::Off,
+        RoutingPreset::AlwaysCodex,
+        RoutingPreset::Fallback,
+    ];
+
     fn label(self) -> &'static str {
         match self {
             RoutingPreset::Off => "Off",
-            RoutingPreset::AlwaysCodex => "Always → Codex",
-            RoutingPreset::AlwaysKimi => "Always → Kimi",
-            RoutingPreset::AlwaysGrok => "Always → Grok",
-            RoutingPreset::Fallback => "Fallback (Anthropic first)",
-        }
-    }
-
-    fn short(self) -> &'static str {
-        match self {
-            RoutingPreset::Off => "off",
-            RoutingPreset::AlwaysCodex => "always/codex",
-            RoutingPreset::AlwaysKimi => "always/kimi",
-            RoutingPreset::AlwaysGrok => "always/grok",
-            RoutingPreset::Fallback => "fallback",
-        }
-    }
-
-    fn always_provider(self) -> Option<SubProvider> {
-        match self {
-            RoutingPreset::AlwaysCodex => Some(SubProvider::Codex),
-            RoutingPreset::AlwaysKimi => Some(SubProvider::Kimi),
-            RoutingPreset::AlwaysGrok => Some(SubProvider::Grok),
-            RoutingPreset::Off | RoutingPreset::Fallback => None,
+            RoutingPreset::AlwaysCodex | RoutingPreset::AlwaysKimi | RoutingPreset::AlwaysGrok => {
+                "Always"
+            }
+            RoutingPreset::Fallback => "Fallback",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
-    /// Cycle presets with ←/→, apply with Enter.
     Presets,
-    /// Edit the active provider's tier map.
     Map,
 }
 
-/// Live state for the Sub tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Col {
+    From,
+    To,
+}
+
+fn hop_display(hop: &str) -> &str {
+    match hop {
+        "anthropic" | "direct" => "what's in use",
+        "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" => "mapped models",
+        "codex" | "chatgpt" | "openai" => "Codex",
+        "claude" => "Claude",
+        "gemini" | "antigravity" | "aistudio" => "Gemini",
+        "grok" | "xai" | "x-ai" => "Grok",
+        "kimi" | "moonshot" => "Kimi",
+        "vertex" => "Vertex",
+        "qwen" => "Qwen",
+        "copilot" | "github" => "Copilot",
+        other => other,
+    }
+}
+
+fn format_try_chain(hops: &[String]) -> String {
+    let names: Vec<&str> = hops.iter().map(|h| hop_display(h)).collect();
+    match names.as_slice() {
+        [] => "Try the next hop on failure".into(),
+        [one] => format!("Try {one}"),
+        [first, rest @ ..] => format!("Try {first}, then {}", rest.join(", then ")),
+    }
+}
+
+fn side_label(col: Col) -> &'static str {
+    match col {
+        Col::From => "input",
+        Col::To => "output",
+    }
+}
+
 pub struct SubPanel {
     focus: Focus,
-    /// Highlighted preset (not necessarily applied yet).
     selected: RoutingPreset,
-    /// What is currently on disk / last applied.
     applied: RoutingPreset,
-    /// Auth flags per provider (Codex, Kimi, Grok) — refreshed on enter/apply.
-    auth: [bool; 3],
-    /// Map editor: provider whose tiers we show (always the active always-provider, or
-    /// the last re-enable target when in fallback/off).
-    map_provider: SubProvider,
-    tiers: [Tier; 4],
-    chosen: [String; 4],
-    catalog: Vec<CatalogEntry>,
-    tier_row: usize,
+    chain: Vec<String>,
+    rows: Vec<(String, String)>,
+    row: usize,
+    col: Col,
+    catalog: Vec<OfficialModel>,
+    search: String,
+    filtered: Vec<String>,
+    filter_idx: usize,
     map_dirty: bool,
+    running: bool,
     status: String,
-    /// True when a config write needs daemon restart + Claude auth sync after the TUI exits.
     pub needs_apply: bool,
+}
+
+impl Default for SubPanel {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubPanel {
     pub fn new() -> Self {
         let applied = Self::read_applied_preset();
-        let map_provider = Self::map_provider_for(applied);
         let mut panel = Self {
             focus: Focus::Presets,
             selected: applied,
             applied,
-            auth: Self::read_auth(),
-            map_provider,
-            tiers: Tier::ALL,
-            chosen: [String::new(), String::new(), String::new(), String::new()],
+            chain: Self::read_chain(),
+            rows: Vec::new(),
+            row: 0,
+            col: Col::To,
             catalog: Vec::new(),
-            tier_row: 0,
+            search: String::new(),
+            filtered: Vec::new(),
+            filter_idx: 0,
             map_dirty: false,
+            running: false,
             status: String::new(),
             needs_apply: false,
         };
+        panel.reload_catalog();
         panel.reload_map();
         panel
     }
 
-    /// Re-read config + auth when the user lands on this tab.
+    pub fn capturing_keys(&self) -> bool {
+        self.focus == Focus::Map
+    }
+
     pub fn refresh(&mut self) {
-        self.applied = Self::read_applied_preset();
-        // Keep the user's in-progress selection if they haven't applied yet and nothing
-        // external changed the applied preset; otherwise snap to disk.
+        let applied = Self::read_applied_preset();
         if !self.needs_apply {
-            self.selected = self.applied;
+            self.selected = applied;
         }
-        self.auth = Self::read_auth();
-        if self.focus == Focus::Presets {
-            self.map_provider = Self::map_provider_for(self.selected);
+        self.applied = applied;
+        self.chain = Self::read_chain();
+        self.running = cliproxy::is_running();
+        if self.focus == Focus::Presets && !self.map_dirty {
+            self.reload_catalog();
             self.reload_map();
-            self.map_dirty = false;
         }
+    }
+
+    pub fn preselect_provider(&mut self, _provider: SubProvider) {
+        self.selected = RoutingPreset::AlwaysCodex;
+        self.status = "highlighted Always — Enter to apply · e to edit map".into();
+    }
+
+    pub fn seed_export_demo(&mut self) {
+        self.selected = RoutingPreset::AlwaysCodex;
+        self.applied = RoutingPreset::AlwaysCodex;
+        self.running = true;
+        self.rows = vec![
+            ("fable".into(), "grok-4.6".into()),
+            ("opus".into(), "grok-4.6".into()),
+            ("sonnet".into(), "grok-4.6".into()),
+            ("haiku".into(), "grok-composer-2.5-fast".into()),
+        ];
+        self.status = "demo".into();
     }
 
     fn read_applied_preset() -> RoutingPreset {
-        // Fresh disk read — RuntimeConfig is process-cached and wrong after our own writes.
         let file = load_config_file();
         let env = |k: &str| std::env::var(k).ok();
-        // `disable_sub` leaves `mode = "fallback"` on disk. Off is "no active provider", not
-        // "mode string says fallback" — otherwise Off → refresh shows Fallback and Enter
-        // re-enables the last provider.
-        let Some(active) = resolve_active(&env, file.as_ref()) else {
+        let Some(_active) = resolve_active(&env, file.as_ref()) else {
             return RoutingPreset::Off;
         };
         if resolve_fallback(&env, file.as_ref()) {
-            return RoutingPreset::Fallback;
-        }
-        match active.as_str() {
-            "codex" => RoutingPreset::AlwaysCodex,
-            "kimi" => RoutingPreset::AlwaysKimi,
-            "grok" => RoutingPreset::AlwaysGrok,
-            _ => RoutingPreset::Off,
+            RoutingPreset::Fallback
+        } else {
+            RoutingPreset::AlwaysCodex
         }
     }
 
-    /// Highlight a preset (and its map) without writing config — used by `sub setup <provider>`.
-    pub fn preselect_provider(&mut self, provider: SubProvider) {
-        self.selected = match provider {
-            SubProvider::Codex => RoutingPreset::AlwaysCodex,
-            SubProvider::Kimi => RoutingPreset::AlwaysKimi,
-            SubProvider::Grok => RoutingPreset::AlwaysGrok,
-        };
-        self.map_provider = provider;
-        self.reload_map();
-        self.map_dirty = false;
-        self.status = format!(
-            "highlighted {} — Enter to apply · e to edit map",
-            provider.as_str()
-        );
-    }
-
-    /// Stable demo state for the README SVG export (not written to disk).
-    #[cfg(test)]
-    pub(crate) fn seed_export_demo(&mut self) {
-        self.focus = Focus::Presets;
-        self.applied = RoutingPreset::AlwaysCodex;
-        self.selected = RoutingPreset::AlwaysCodex;
-        self.auth = [true, false, true]; // codex ✓ · kimi · · grok ✓
-        self.map_provider = SubProvider::Codex;
-        self.reload_map();
-        self.map_dirty = false;
-        self.status.clear();
-        self.needs_apply = false;
-    }
-
-    fn map_provider_for(preset: RoutingPreset) -> SubProvider {
-        if let Some(p) = preset.always_provider() {
-            return p;
-        }
-        // Fallback / Off: prefer last/active provider so the map still has a target.
-        llmtrim_core::config::sub_reenable_provider()
-            .as_deref()
-            .and_then(SubProvider::parse)
-            .unwrap_or(SubProvider::Codex)
-    }
-
-    fn read_auth() -> [bool; 3] {
-        [
-            auth_ok(SubProvider::Codex),
-            auth_ok(SubProvider::Kimi),
-            auth_ok(SubProvider::Grok),
-        ]
+    fn reload_catalog(&mut self) {
+        self.catalog = cliproxy::official_models();
+        self.refilter();
     }
 
     fn reload_map(&mut self) {
-        self.catalog = catalog::models_for(self.map_provider);
-        let overrides = llmtrim_core::config::sub_tiers_for(self.map_provider.as_str());
-        let in_catalog = |id: &str| self.catalog.iter().any(|e| e.id == id);
-        self.chosen = self.tiers.map(|t| match self.map_provider {
-            SubProvider::Kimi => KIMI_MODEL.to_string(),
-            SubProvider::Codex => overrides
-                .get(t.as_str())
-                .filter(|m| in_catalog(m) || m.starts_with("gpt-"))
-                .cloned()
-                .unwrap_or_else(|| default_codex_tier_model(t).to_string()),
-            SubProvider::Grok => overrides
-                .get(t.as_str())
-                .filter(|m| in_catalog(m) || m.starts_with("grok-"))
-                .cloned()
-                .unwrap_or_else(|| default_grok_tier_model(t).to_string()),
-        });
-        self.tier_row = self.tier_row.min(self.tiers.len().saturating_sub(1));
+        let overrides = llmtrim_core::config::sub_tiers_for("on");
+        let mut rows: Vec<(String, String)> = overrides.into_iter().collect();
+        if rows.is_empty() {
+            rows = Tier::ALL
+                .iter()
+                .map(|t| (t.as_str().to_string(), String::new()))
+                .collect();
+        }
+        self.rows = rows;
+        if self.row >= self.rows.len() {
+            self.row = self.rows.len().saturating_sub(1);
+        }
+        self.map_dirty = false;
+        self.search.clear();
+        self.refilter();
     }
 
-    /// Handle a key while the Sub tab is focused. Returns true if the TUI should quit.
+    fn input_suggestions(&self) -> Vec<String> {
+        let mut out: Vec<String> = Tier::ALL.iter().map(|t| t.as_str().to_string()).collect();
+        for m in &self.catalog {
+            if !out.iter().any(|x| x == &m.id) {
+                out.push(m.id.clone());
+            }
+        }
+        out
+    }
+
+    fn refilter(&mut self) {
+        let q = self.search.trim().to_ascii_lowercase();
+        let pool = match self.col {
+            Col::From => self.input_suggestions(),
+            Col::To => self
+                .catalog
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+        };
+        self.filtered = if q.is_empty() {
+            pool
+        } else {
+            pool.into_iter()
+                .filter(|id| {
+                    id.to_ascii_lowercase().contains(&q)
+                        || self.catalog.iter().any(|m| {
+                            m.id == *id
+                                && (m.display_name.to_ascii_lowercase().contains(&q)
+                                    || m.family.to_ascii_lowercase().contains(&q)
+                                    || m.owned_by.to_ascii_lowercase().contains(&q))
+                        })
+                })
+                .collect()
+        };
+        let current = self.rows.get(self.row).map(|(f, t)| match self.col {
+            Col::From => f.as_str(),
+            Col::To => t.as_str(),
+        });
+        self.filter_idx = current
+            .and_then(|c| self.filtered.iter().position(|id| id == c))
+            .unwrap_or(0);
+        if self.filter_idx >= self.filtered.len() {
+            self.filter_idx = self.filtered.len().saturating_sub(1);
+        }
+    }
+
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode;
         match self.focus {
             Focus::Presets => match code {
                 KeyCode::Left | KeyCode::Char('h') => self.cycle_preset(-1),
                 KeyCode::Right | KeyCode::Char('l') => self.cycle_preset(1),
+                KeyCode::Char('[') => self.rotate_chain(-1),
+                KeyCode::Char(']') => self.rotate_chain(1),
                 KeyCode::Enter => self.apply_selected(),
-                KeyCode::Char('e') => self.enter_map(),
-                KeyCode::Char('r') => {
-                    self.refresh();
-                    self.status = "refreshed".into();
+                KeyCode::Char('e') => {
+                    self.focus = Focus::Map;
+                    self.col = Col::To;
+                    self.search.clear();
+                    self.refilter();
+                    self.status =
+                        "← from  → to  ·  type to search  ·  s save  ·  a add  ·  d del  ·  Esc"
+                            .into();
                 }
-                _ => {}
+                KeyCode::Char('r') => {
+                    self.reload_catalog();
+                    self.refresh();
+                    self.status = "refreshed official model list".into();
+                }
+                _ => return false,
             },
             Focus::Map => match code {
                 KeyCode::Esc => {
-                    if self.map_dirty {
+                    if !self.search.is_empty() {
+                        self.search.clear();
+                        self.refilter();
+                    } else if self.map_dirty {
+                        self.reload_map();
                         self.status = "unsaved map changes discarded".into();
+                        self.focus = Focus::Presets;
+                    } else {
+                        self.focus = Focus::Presets;
                     }
-                    self.map_dirty = false;
-                    self.focus = Focus::Presets;
-                    self.reload_map();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.tier_row = self.tier_row.saturating_sub(1);
+                KeyCode::Left => {
+                    self.col = Col::From;
+                    self.search.clear();
+                    self.refilter();
+                    self.status = "editing input (incoming model or tier)".into();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.tier_row = (self.tier_row + 1).min(self.tiers.len() - 1);
+                KeyCode::Right => {
+                    self.col = Col::To;
+                    self.search.clear();
+                    self.refilter();
+                    self.status = "editing output (mapped model)".into();
                 }
-                KeyCode::Left | KeyCode::Char('h') => self.cycle_model(-1),
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.cycle_model(1),
-                KeyCode::Char('s') => self.save_map(),
-                _ => {}
+                KeyCode::Up => self.move_pick(-1),
+                KeyCode::Down => self.move_pick(1),
+                KeyCode::Tab => self.move_row(1),
+                KeyCode::BackTab => self.move_row(-1),
+                KeyCode::Char('a') | KeyCode::Char('+') | KeyCode::Insert
+                    if self.search.is_empty() =>
+                {
+                    self.add_row();
+                }
+                KeyCode::Char('d') | KeyCode::Char('-') | KeyCode::Delete
+                    if self.search.is_empty() =>
+                {
+                    self.remove_row();
+                }
+                KeyCode::Char('s') if self.search.is_empty() => self.save_map(),
+                KeyCode::Char('w') if self.search.is_empty() => self.save_map(),
+                KeyCode::Backspace => {
+                    self.search.pop();
+                    self.apply_search_to_cell();
+                }
+                KeyCode::Enter => {
+                    if let Some(id) = self.filtered.get(self.filter_idx).cloned() {
+                        self.set_cell(id);
+                        self.search.clear();
+                        self.refilter();
+                    }
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    self.search.push(c);
+                    self.apply_search_to_cell();
+                }
+                _ => return false,
             },
         }
-        false
+        true
+    }
+
+    fn move_row(&mut self, dir: i32) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let n = self.rows.len() as i32;
+        self.row = (self.row as i32 + dir).rem_euclid(n) as usize;
+        self.search.clear();
+        self.refilter();
+    }
+
+    fn add_row(&mut self) {
+        self.rows.push((String::new(), String::new()));
+        self.row = self.rows.len() - 1;
+        self.col = Col::From;
+        self.search.clear();
+        self.map_dirty = true;
+        self.refilter();
+        self.status = "new row — type the input model".into();
+    }
+
+    fn remove_row(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.rows.remove(self.row);
+        if self.row >= self.rows.len() {
+            self.row = self.rows.len().saturating_sub(1);
+        }
+        self.map_dirty = true;
+        self.search.clear();
+        self.refilter();
+        self.status = "row removed".into();
+    }
+
+    fn set_cell(&mut self, value: String) {
+        if let Some(row) = self.rows.get_mut(self.row) {
+            match self.col {
+                Col::From => row.0 = value,
+                Col::To => row.1 = value,
+            }
+            self.map_dirty = true;
+        }
+    }
+
+    fn apply_search_to_cell(&mut self) {
+        self.refilter();
+        self.filter_idx = 0;
+        self.set_cell(self.search.clone());
+    }
+
+    fn move_pick(&mut self, dir: i32) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let n = self.filtered.len() as i32;
+        self.filter_idx = (self.filter_idx as i32 + dir).rem_euclid(n) as usize;
     }
 
     fn cycle_preset(&mut self, dir: i32) {
-        let list = RoutingPreset::ALL;
+        let list = RoutingPreset::CYCLE;
         let pos = list.iter().position(|p| *p == self.selected).unwrap_or(0) as i32;
         let next = (pos + dir).rem_euclid(list.len() as i32) as usize;
         self.selected = list[next];
-        self.map_provider = Self::map_provider_for(self.selected);
-        self.reload_map();
-        self.map_dirty = false;
         self.status.clear();
+    }
+
+    fn read_chain() -> Vec<String> {
+        if let Ok(v) = std::env::var("LLMTRIM_SUB_CHAIN") {
+            return v.split(',').filter_map(cliproxy::parse_hop).collect();
+        }
+        load_config_file()
+            .as_ref()
+            .and_then(|v| v.get("sub"))
+            .and_then(|v| v.get("chain"))
+            .map(|v| match v {
+                toml::Value::Array(items) => items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .filter_map(cliproxy::parse_hop)
+                    .collect(),
+                toml::Value::String(s) => s.split(',').filter_map(cliproxy::parse_hop).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    fn rotate_chain(&mut self, dir: i32) {
+        if self.selected != RoutingPreset::Fallback {
+            self.selected = RoutingPreset::Fallback;
+        }
+        if self.chain.is_empty() {
+            self.chain = vec!["anthropic".into(), "on".into()];
+        }
+        let n = self.chain.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let k = dir.rem_euclid(n) as usize;
+        self.chain.rotate_left(k);
+        self.status = format_try_chain(&self.chain);
     }
 
     fn apply_selected(&mut self) {
@@ -284,8 +457,6 @@ impl SubPanel {
             Ok(msg) => {
                 self.applied = self.selected;
                 self.needs_apply = true;
-                self.auth = Self::read_auth();
-                self.map_provider = Self::map_provider_for(self.applied);
                 self.reload_map();
                 self.status = msg;
             }
@@ -294,133 +465,66 @@ impl SubPanel {
     }
 
     fn apply_preset(&self, preset: RoutingPreset) -> anyhow::Result<String> {
+        let _ = llmtrim_core::config::write_sub_model(None);
         match preset {
             RoutingPreset::Off => {
                 llmtrim_core::config::disable_sub()?;
-                Ok(
-                    "routing off — traffic stays on Anthropic (compression only). Restart applies."
-                        .into(),
-                )
+                Ok("reroute off — Anthropic only".into())
             }
             RoutingPreset::AlwaysCodex | RoutingPreset::AlwaysKimi | RoutingPreset::AlwaysGrok => {
-                let p = preset.always_provider().expect("always_* has provider");
-                // Mode first so a prior fallback config doesn't leave always-intent half-applied.
+                cliproxy::ensure_for_existing_user()?;
+                llmtrim_core::config::enable_sub("on")?;
                 llmtrim_core::config::write_sub_mode(false)?;
-                // enable_sub keeps an existing map; if the provider was never configured,
-                // seed defaults via write_sub_mapping (also sets active).
-                let had_map = !llmtrim_core::config::sub_tiers_for(p.as_str()).is_empty();
-                if had_map {
-                    llmtrim_core::config::enable_sub(p.as_str())?;
-                } else {
-                    let map = default_tier_map(p);
-                    llmtrim_core::config::write_sub_mapping(p.as_str(), &map)?;
-                }
-                let auth = auth_ok(p);
-                let mut msg = format!(
-                    "always → {} applied. Restart applies to the live daemon.",
-                    p.as_str()
-                );
-                if !auth {
-                    msg.push_str(&format!(
-                        " Not logged in — run `llmtrim sub auth {} login`.",
-                        p.as_str()
-                    ));
-                }
-                Ok(msg)
+                Ok("always on — every turn uses the mapped models".into())
             }
             RoutingPreset::Fallback => {
+                cliproxy::ensure_for_existing_user()?;
+                llmtrim_core::config::enable_sub("on")?;
                 llmtrim_core::config::write_sub_mode(true)?;
-                // Ensure there is someone to fall back to: keep active if set, else re-enable last.
-                let file = load_config_file();
-                let env = |k: &str| std::env::var(k).ok();
-                if resolve_active(&env, file.as_ref()).is_none() {
-                    if let Some(p) = llmtrim_core::config::sub_reenable_provider() {
-                        llmtrim_core::config::enable_sub(&p)?;
-                    } else {
-                        // First-time fallback: seed Codex as the chain target.
-                        let map = default_tier_map(SubProvider::Codex);
-                        llmtrim_core::config::write_sub_mapping(SubProvider::Codex.as_str(), &map)?;
-                        llmtrim_core::config::write_sub_mode(true)?;
-                    }
-                }
-                Ok(
-                    "fallback applied — Anthropic first; subscription chain on failure. \
-                     Needs a live Anthropic login. Restart applies."
-                        .into(),
-                )
+                let chain = if self.chain.is_empty() {
+                    vec!["anthropic".into(), "on".into()]
+                } else {
+                    self.chain.clone()
+                };
+                llmtrim_core::config::write_sub_chain(&chain)?;
+                Ok(format_try_chain(&chain))
             }
         }
-    }
-
-    fn enter_map(&mut self) {
-        self.map_provider = Self::map_provider_for(self.applied);
-        // Prefer the selected always-provider if user is about to apply, but map edits
-        // always target the *applied* backend so we never write tiers for a backend that
-        // is not live (and confuse "I edited Grok" with "I'm still on Codex").
-        if let Some(p) = self.applied.always_provider() {
-            self.map_provider = p;
-        } else if let Some(p) = self.selected.always_provider() {
-            // Off/Fallback applied but user highlighted Always·X — still edit that provider's
-            // staged map so they can prepare before applying.
-            self.map_provider = p;
-        }
-        self.reload_map();
-        self.map_dirty = false;
-        self.focus = Focus::Map;
-        self.status = format!(
-            "editing {} map — s save · Esc back",
-            self.map_provider.as_str()
-        );
-    }
-
-    fn cycle_model(&mut self, dir: i32) {
-        if self.map_provider == SubProvider::Kimi || self.catalog.is_empty() {
-            self.status = "Kimi has a single model; nothing to change.".into();
-            return;
-        }
-        let cur = &self.chosen[self.tier_row];
-        let pos = self.catalog.iter().position(|e| &e.id == cur).unwrap_or(0);
-        let len = self.catalog.len() as i32;
-        let next = ((pos as i32) + dir).rem_euclid(len) as usize;
-        self.chosen[self.tier_row] = self.catalog[next].id.clone();
-        self.map_dirty = true;
-        self.status.clear();
     }
 
     fn save_map(&mut self) {
         let mut map = BTreeMap::new();
-        for (t, m) in self.tiers.iter().zip(self.chosen.iter()) {
-            map.insert(t.as_str().to_string(), m.clone());
+        for (from, to) in &self.rows {
+            let from = from.trim();
+            let to = to.trim();
+            if !from.is_empty() && !to.is_empty() {
+                map.insert(from.to_string(), to.to_string());
+            }
         }
-        match llmtrim_core::config::write_sub_tiers(self.map_provider.as_str(), &map) {
+        match llmtrim_core::config::write_sub_tiers("on", &map) {
             Ok(()) => {
                 self.map_dirty = false;
-                // Only restart if this provider is the live one (always mode) or in the chain.
-                let live = self.applied.always_provider() == Some(self.map_provider)
-                    || self.applied == RoutingPreset::Fallback;
-                if live {
-                    self.needs_apply = true;
-                }
-                self.status = format!(
-                    "saved {} map{}",
-                    self.map_provider.as_str(),
-                    if live {
-                        " — restart applies"
-                    } else {
-                        " (not live until you apply that provider)"
-                    }
-                );
+                self.needs_apply = true;
+                self.search.clear();
+                self.status = format!("saved {} mappings — quit the TUI to apply", map.len());
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
 
+    pub fn save_now(&mut self) {
+        self.save_map();
+    }
+
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
             Focus::Presets => {
-                " Tab tabs · ←→ preset · ⏎ apply · e edit map · r refresh · t theme · q"
+                " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q"
             }
-            Focus::Map => " ↑↓ tier · ←→ model · s save · Esc back · t theme · q",
+            Focus::Map if self.map_dirty => {
+                " ← from · → to · ↑↓ pick · Enter pick · s SAVE · a add · d del · Esc discard"
+            }
+            Focus::Map => " ← from · → to · ↑↓ pick · Enter pick · s save · a add · d del · Esc",
         }
     }
 
@@ -430,275 +534,185 @@ impl SubPanel {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(frame)
-            .title(" sub · subscription routing ")
+            .title(" sub · CLIProxyAPI ")
             .title_style(frame.add_modifier(Modifier::BOLD))
             .padding(Padding::new(1, 1, 0, 0));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        let suggest_h = if self.focus == Focus::Map { 8 } else { 0 };
         let chunks = Layout::vertical([
-            Constraint::Length(7), // presets + auth
-            Constraint::Min(6),    // map summary / editor
-            Constraint::Length(2), // status
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(suggest_h),
+            Constraint::Length(2),
         ])
         .split(inner);
 
-        self.render_presets(f, chunks[0]);
-        self.render_map(f, chunks[1]);
-        self.render_status(f, chunks[2]);
-    }
-
-    fn render_presets(&self, f: &mut Frame, area: Rect) {
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled("Routing  ", Style::default().fg(palette::muted_gray())),
-            Span::styled(
-                self.applied.label(),
-                Style::default()
-                    .fg(palette::text())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if self.selected != self.applied {
-                    format!("   →  {}", self.selected.label())
-                } else {
-                    String::new()
-                },
-                Style::default().fg(palette::accent()),
-            ),
-        ]));
-
-        // Preset chips
-        let mut chips = Vec::new();
-        for (i, p) in RoutingPreset::ALL.iter().enumerate() {
-            if i > 0 {
-                chips.push(Span::raw("  "));
-            }
-            let selected = *p == self.selected;
-            let applied = *p == self.applied;
-            let style = if selected && self.focus == Focus::Presets {
-                Style::default()
-                    .bg(palette::accent())
-                    .fg(palette::bg())
-                    .add_modifier(Modifier::BOLD)
-            } else if applied {
-                Style::default()
-                    .fg(palette::green())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette::muted_gray())
-            };
-            let mark = if applied { "● " } else { "○ " };
-            chips.push(Span::styled(format!("{mark}{}", p.short()), style));
-        }
-        lines.push(Line::from(chips));
-
-        // Auth row
-        let providers = [
-            (SubProvider::Codex, self.auth[0]),
-            (SubProvider::Kimi, self.auth[1]),
-            (SubProvider::Grok, self.auth[2]),
-        ];
-        let mut auth_spans = vec![Span::styled(
-            "Auth     ",
-            Style::default().fg(palette::muted_gray()),
-        )];
-        for (i, (p, ok)) in providers.iter().enumerate() {
-            if i > 0 {
-                auth_spans.push(Span::raw("  "));
-            }
-            let (glyph, color) = if *ok {
-                ("✓", palette::green())
-            } else {
-                ("·", palette::muted_gray())
-            };
-            auth_spans.push(Span::styled(
-                format!("{glyph} {}", p.as_str()),
-                Style::default().fg(color),
-            ));
-        }
-        lines.push(Line::from(auth_spans));
-
-        // Mode side-effect hint
-        let hint = match self.selected {
-            RoutingPreset::Off => "Claude uses Anthropic only (compression still on).",
-            RoutingPreset::AlwaysCodex | RoutingPreset::AlwaysKimi | RoutingPreset::AlwaysGrok => {
-                "Always-on: dummy Anthropic token by default (connectors off). Restart Claude Code after apply."
-            }
-            RoutingPreset::Fallback => {
-                "Fallback needs a live Anthropic login; connectors stay available."
-            }
-        };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(palette::muted_gray()),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Enter applies the highlighted preset.  e edits models for the target provider.",
-            Style::default().fg(palette::muted_gray()),
-        )));
-
-        f.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn render_map(&self, f: &mut Frame, area: Rect) {
-        let title = match self.focus {
-            Focus::Presets => format!(
-                " map · {} (read-only — press e to edit) ",
-                self.map_provider.as_str()
-            ),
-            Focus::Map => {
-                let dirty = if self.map_dirty { " · unsaved" } else { "" };
-                format!(" map · {}{dirty} ", self.map_provider.as_str())
-            }
-        };
-        let editing = self.focus == Focus::Map;
-        let border = if editing {
-            Style::default().fg(palette::accent())
+        let presets: Vec<Span> = RoutingPreset::CYCLE
+            .iter()
+            .flat_map(|p| {
+                let on = *p == self.selected;
+                let applied = *p == self.applied;
+                let mut style = Style::default();
+                if on {
+                    style = style.fg(palette::accent()).add_modifier(Modifier::BOLD);
+                }
+                let mark = if applied { "*" } else { " " };
+                [
+                    Span::styled(format!("{mark}{} ", p.label()), style),
+                    Span::raw(" "),
+                ]
+            })
+            .collect();
+        let sidecar = if self.running {
+            "sidecar up"
         } else {
-            Style::default().fg(palette::frame())
+            "sidecar down"
         };
-
-        let rows = self.tiers.iter().enumerate().map(|(i, t)| {
-            let model = &self.chosen[i];
-            let (inp, outp) = self
-                .catalog
-                .iter()
-                .find(|e| e.id == *model)
-                .map(|e| {
-                    (
-                        e.input
-                            .map(|v| format!("${v:.2}"))
-                            .unwrap_or_else(|| "—".into()),
-                        e.output
-                            .map(|v| format!("${v:.2}"))
-                            .unwrap_or_else(|| "—".into()),
-                    )
-                })
-                .unwrap_or_else(|| ("—".into(), "—".into()));
-            let style = if editing && i == self.tier_row {
-                Style::default()
-                    .bg(palette::accent())
-                    .fg(palette::bg())
-                    .add_modifier(Modifier::BOLD)
+        let header = Paragraph::new(vec![
+            Line::from(presets),
+            Line::from(format!(
+                "{sidecar} · {} official models · * = applied",
+                self.catalog.len()
+            )),
+            Line::from(if self.selected == RoutingPreset::Fallback {
+                let hops = if self.chain.is_empty() {
+                    vec!["anthropic".into(), "on".into()]
+                } else {
+                    self.chain.clone()
+                };
+                format_try_chain(&hops)
             } else {
-                Style::default().fg(palette::text())
-            };
-            Row::new(vec![
-                Cell::from(t.as_str().to_string()),
-                Cell::from("→"),
-                Cell::from(model.clone()),
-                Cell::from(inp),
-                Cell::from(outp),
-            ])
-            .style(style)
-        });
+                String::new()
+            }),
+        ]);
+        f.render_widget(header, chunks[0]);
 
+        let rows: Vec<Row> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, (from, to))| {
+                let active = self.focus == Focus::Map && i == self.row;
+                let from_s = if from.is_empty() {
+                    "…"
+                } else {
+                    from.as_str()
+                };
+                let to_s = if to.is_empty() {
+                    "(pass through)"
+                } else {
+                    to.as_str()
+                };
+                let from_style = if active && self.col == Col::From {
+                    Style::default()
+                        .fg(palette::accent())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if active {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let to_style = if active && self.col == Col::To {
+                    Style::default()
+                        .fg(palette::accent())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if active {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![
+                    ratatui::widgets::Cell::from(from_s.to_string()).style(from_style),
+                    ratatui::widgets::Cell::from(to_s.to_string()).style(to_style),
+                ])
+            })
+            .collect();
         let table = Table::new(
             rows,
-            [
-                Constraint::Length(10),
-                Constraint::Length(3),
-                Constraint::Min(18),
-                Constraint::Length(10),
-                Constraint::Length(10),
-            ],
+            [Constraint::Percentage(40), Constraint::Percentage(60)],
         )
         .header(
-            Row::new(vec!["Claude tier", "", "Model", "$/1M in", "$/1M out"]).style(
-                Style::default()
-                    .fg(palette::muted_gray())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(border)
-                .title(title)
-                .title_style(border.add_modifier(Modifier::BOLD)),
+            Row::new(vec!["input", "output"]).style(Style::default().add_modifier(Modifier::BOLD)),
         );
-        f.render_widget(table, area);
-    }
+        f.render_widget(table, chunks[1]);
 
-    fn render_status(&self, f: &mut Frame, area: Rect) {
-        let text = if self.status.is_empty() {
-            match self.focus {
-                Focus::Presets => {
-                    if self.selected != self.applied {
-                        format!(
-                            "highlight: {} · applied: {} · Enter to apply",
-                            self.selected.short(),
-                            self.applied.short()
-                        )
-                    } else {
-                        format!("applied: {}", self.applied.short())
-                    }
-                }
-                Focus::Map => format!(
-                    "editing {}{}",
-                    self.map_provider.as_str(),
-                    if self.map_dirty { " [unsaved]" } else { "" }
-                ),
+        if self.focus == Focus::Map {
+            let title = if self.search.is_empty() {
+                format!("{} · {} models", side_label(self.col), self.filtered.len())
+            } else {
+                format!("\"{}\" · {} matches", self.search, self.filtered.len())
+            };
+            let items: Vec<ListItem> = if self.filtered.is_empty() {
+                vec![ListItem::new("(no matches)")]
+            } else {
+                self.filtered
+                    .iter()
+                    .map(|id| ListItem::new(id.as_str()))
+                    .collect()
+            };
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(palette::frame()))
+                        .title(title),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(palette::accent())
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                )
+                .highlight_symbol("› ");
+            let mut state = ListState::default();
+            if !self.filtered.is_empty() {
+                state.select(Some(self.filter_idx.min(self.filtered.len() - 1)));
             }
+            f.render_stateful_widget(list, chunks[2], &mut state);
+        }
+
+        let hint = if self.focus == Focus::Map {
+            let n = self.filtered.len();
+            let side = match self.col {
+                Col::From => "from",
+                Col::To => "to",
+            };
+            format!(
+                "{side} search: {}  ·  {n} hits  ·  {}",
+                if self.search.is_empty() {
+                    "_"
+                } else {
+                    self.search.as_str()
+                },
+                self.status
+            )
         } else {
             self.status.clone()
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                text,
-                Style::default().fg(palette::muted_gray()),
-            ))),
-            area,
-        );
+        f.render_widget(Paragraph::new(hint), chunks[2]);
     }
-}
-
-impl Default for SubPanel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn auth_ok(p: SubProvider) -> bool {
-    crate::reroute::auth::auth_status_json(p)["logged_in"]
-        .as_bool()
-        .unwrap_or(false)
-}
-
-fn default_tier_map(p: SubProvider) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    match p {
-        SubProvider::Codex => {
-            for t in Tier::ALL {
-                map.insert(
-                    t.as_str().to_string(),
-                    default_codex_tier_model(t).to_string(),
-                );
-            }
-        }
-        SubProvider::Grok => {
-            for t in Tier::ALL {
-                map.insert(
-                    t.as_str().to_string(),
-                    default_grok_tier_model(t).to_string(),
-                );
-            }
-        }
-        SubProvider::Kimi => {
-            for t in Tier::ALL {
-                map.insert(t.as_str().to_string(), KIMI_MODEL.to_string());
-            }
-        }
-    }
-    map
 }
 
 fn load_config_file() -> Option<toml::Value> {
-    let path = llmtrim_core::config::config_file_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
+    let path = std::env::var("LLMTRIM_CONFIG")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| std::path::PathBuf::from(h).join(".config"))
+                })
+                .map(|b| b.join("llmtrim").join("config.toml"))
+        })?;
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
 }
 
 fn resolve_active(
@@ -739,13 +753,8 @@ fn resolve_fallback(env: &impl Fn(&str) -> Option<String>, file: Option<&toml::V
 }
 
 /// Reconcile Claude dummy-auth + restart the interceptor so a Sub-tab write takes effect.
-/// Best-effort: never panics; returns a short status string for the caller to print after exit.
-///
-/// Mirrors `main::apply_sub_change`: always sync auth env; only restart when a daemon is
-/// already running (so a pure-config edit never spawns a new interceptor by surprise).
 pub fn apply_pending_changes() -> String {
     use crate::statusline::SubAuthEnvChange;
-    // Same rule as main::sync_claude_sub_auth.
     let want = llmtrim_core::config::sub_skip_anthropic_login();
     let mut parts = Vec::new();
     match crate::statusline::sync_sub_auth_env(want) {
@@ -760,6 +769,11 @@ pub fn apply_pending_changes() -> String {
         Ok(SubAuthEnvChange::Unchanged) => {}
         Err(e) => parts.push(format!("Claude Code auth env update failed: {e:#}")),
     }
+    if llmtrim_core::config::sub_always_on()
+        && let Err(e) = cliproxy::ensure_for_existing_user()
+    {
+        parts.push(format!("CLIProxyAPI: {e:#}"));
+    }
     let daemon_msg = match crate::daemon::running() {
         None => {
             "Subscription routing saved (no daemon running — next start picks it up).".to_string()
@@ -772,15 +786,15 @@ pub fn apply_pending_changes() -> String {
                         format!("Subscription routing applied (restarted daemon pid {pid}).")
                     }
                     Err(e) => format!(
-                        "Subscription config saved, but restart failed: {e:#}.                          Run `llmtrim start --force`."
+                        "Subscription config saved, but restart failed: {e:#}. Run `llmtrim start --force`."
                     ),
                 },
                 Ok(false) => {
-                    "Subscription config saved, but the old daemon did not release the port.                      Run `llmtrim start --force`."
+                    "Subscription config saved, but the old daemon did not release the port. Run `llmtrim start --force`."
                         .to_string()
                 }
                 Err(e) => format!(
-                    "Subscription config saved, but restart failed: {e:#}.                      Run `llmtrim start --force`."
+                    "Subscription config saved, but restart failed: {e:#}. Run `llmtrim start --force`."
                 ),
             }
         }
@@ -794,60 +808,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preset_cycle_wraps() {
-        let mut p = SubPanel::new();
-        p.selected = RoutingPreset::Off;
-        p.cycle_preset(1);
-        assert_eq!(p.selected, RoutingPreset::AlwaysCodex);
-        p.selected = RoutingPreset::Fallback;
-        p.cycle_preset(1);
-        assert_eq!(p.selected, RoutingPreset::Off);
-        p.cycle_preset(-1);
-        assert_eq!(p.selected, RoutingPreset::Fallback);
+    fn new_panel_starts_on_presets() {
+        let p = SubPanel::new();
+        assert!(!p.needs_apply);
+        assert!(!p.capturing_keys());
     }
 
     #[test]
-    fn map_provider_for_always_matches() {
+    fn try_chain_sentence_hides_internal_on() {
         assert_eq!(
-            SubPanel::map_provider_for(RoutingPreset::AlwaysGrok),
-            SubProvider::Grok
+            format_try_chain(&["anthropic".into(), "on".into()]),
+            "Try what's in use, then mapped models"
         );
         assert_eq!(
-            SubPanel::map_provider_for(RoutingPreset::AlwaysKimi),
-            SubProvider::Kimi
+            format_try_chain(&["codex".into(), "anthropic".into()]),
+            "Try Codex, then what's in use"
         );
-    }
-
-    #[test]
-    fn read_applied_preset_off_wins_over_stale_fallback_mode() {
-        // Unit-level: resolve_active None => Off, even if resolve_fallback would be true.
-        // (Integration against a temp config file would also work; this guards the branch order.)
-        assert_eq!(
-            {
-                // Simulate the fixed decision order with local values.
-                let active: Option<String> = None;
-                let fallback = true;
-                match active {
-                    None => RoutingPreset::Off,
-                    Some(_) if fallback => RoutingPreset::Fallback,
-                    Some(a) => match a.as_str() {
-                        "codex" => RoutingPreset::AlwaysCodex,
-                        _ => RoutingPreset::Off,
-                    },
-                }
-            },
-            RoutingPreset::Off
-        );
-    }
-
-    #[test]
-    fn kimi_cycle_model_is_noop() {
-        let mut p = SubPanel::new();
-        p.map_provider = SubProvider::Kimi;
-        p.reload_map();
-        let before = p.chosen.clone();
-        p.cycle_model(1);
-        assert_eq!(p.chosen, before);
-        assert!(!p.map_dirty);
     }
 }

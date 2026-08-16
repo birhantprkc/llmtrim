@@ -926,9 +926,9 @@ pub struct RuntimeConfig {
     /// name (`mocha`/`macchiato`/`frappe`/`latte`). The `t` key persists the user's choice
     /// here via [`save_theme`]. The TUI validates the name and falls back to its default.
     pub theme: Option<String>,
-    /// Subscription reroute target (env `LLMTRIM_SUB` / file `sub`): `codex`, `kimi`, or `grok` reroutes
-    /// intercepted Anthropic `/v1/messages` traffic to that subscription's backend instead of
-    /// Anthropic (translating the request/response wire shapes). `off`/unset keeps the
+    /// Subscription reroute target (env `LLMTRIM_SUB` / file `sub`): `on` (or `cliproxy`)
+    /// rewrites intercepted Anthropic `/v1/messages` traffic to the managed CLIProxyAPI sidecar.
+    /// Legacy `codex`/`kimi`/`grok` values still enable the sidecar. `off`/unset keeps the
     /// transparent compress-and-forward behavior. Lowercased; an unknown value is left as-is
     /// for the serve layer to reject with a clear error.
     pub sub: Option<String>,
@@ -1290,6 +1290,42 @@ fn resolve_sub_skip_anthropic_login(
         .and_then(toml::Value::as_str)
         .map(parse)
         .unwrap_or(true) // default: skip Anthropic login while always-sub
+}
+
+/// Global CLIProxyAPI model pin (`sub.model` / `LLMTRIM_SUB_MODEL`). `None` = pass Claude ids
+/// through (or expand a backend alias at request time).
+pub fn sub_model() -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let file = load_config_file();
+    resolve_sub_model(&env, file.as_ref())
+}
+
+fn resolve_sub_model(
+    env: &impl Fn(&str) -> Option<String>,
+    file: Option<&toml::Value>,
+) -> Option<String> {
+    if let Some(v) = env("LLMTRIM_SUB_MODEL").filter(|s| !s.is_empty()) {
+        return Some(v.trim().to_string());
+    }
+    file.and_then(|v| v.get("sub"))
+        .and_then(|v| v.get("model"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Persist or clear the global CLIProxyAPI model pin.
+pub fn write_sub_model(model: Option<&str>) -> Result<()> {
+    let path = config_path().ok_or_else(|| anyhow::anyhow!("no config path (HOME/XDG unset)"))?;
+    edit_sub_table_at(&path, |t| {
+        match model.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(m) => t["model"] = toml_edit::value(m),
+            None => {
+                t.remove("model");
+            }
+        }
+    })
 }
 
 /// Persist `sub.anthropic_login`: `skip` (dummy token, no Anthropic /login) or `keep` (claude.ai

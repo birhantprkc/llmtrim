@@ -578,6 +578,9 @@ fn reroute_real_window(
         "codex" => SubProvider::Codex,
         "kimi" => SubProvider::Kimi,
         "grok" => SubProvider::Grok,
+        "on" | "cliproxy" | "cli-proxy-api" => {
+            return upstream_window(incoming_model_id);
+        }
         _ => return None,
     };
     upstream_window(&crate::reroute::resolve_model(sp, incoming_model_id, tiers))

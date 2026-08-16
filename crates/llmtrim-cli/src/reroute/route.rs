@@ -137,11 +137,13 @@ pub fn resolve_explicit_model(provider: SubProvider, value: &str) -> Result<Stri
             "kimi" | "k2" | "kimik2" | "kimiforcoding" => super::KIMI_MODEL,
             _ => value,
         },
+        SubProvider::CliProxy => value,
     };
     let accepted = match provider {
         SubProvider::Codex => super::CODEX_MODELS.contains(&model),
         SubProvider::Grok => super::GROK_MODELS.contains(&model),
         SubProvider::Kimi => model == super::KIMI_MODEL,
+        SubProvider::CliProxy => true,
     };
     if accepted {
         return Ok(model.to_ascii_lowercase());
@@ -150,6 +152,7 @@ pub fn resolve_explicit_model(provider: SubProvider, value: &str) -> Result<Stri
         SubProvider::Codex => super::CODEX_MODELS.join(", "),
         SubProvider::Grok => super::GROK_MODELS.join(", "),
         SubProvider::Kimi => super::KIMI_MODEL.to_string(),
+        SubProvider::CliProxy => "any CLIProxyAPI model".to_string(),
     };
     bail!(
         "llmtrim: unknown {provider} route model `{value}`; supported models: {supported}",

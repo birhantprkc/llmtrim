@@ -8,6 +8,28 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **`sub` now uses CLIProxyAPI.** `llmtrim sub on` installs and starts
+  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), then rewrites intercepted
+  Anthropic `/v1/messages` to it. Existing `sub = codex|kimi|grok` configs keep working:
+  `update` / `ensure` install the sidecar, import stored tokens, and keep the old
+  tier→model map. First-party Codex/Kimi/Grok protocol translation is no longer the
+  live path.
+
+  - **CLI / `/sub` / tab 4:** `llmtrim sub on [cli-or-model]`, `/sub on [cli-or-model]`,
+    and status tab 4 accept every CLIProxyAPI CLI (codex, claude, gemini/antigravity,
+    grok, kimi, vertex, qwen, copilot) plus official catalog ids
+    (`https://models.router-for.me/models.json`). `sub on grok` writes the
+    opus/sonnet/haiku/fable map; it does not pin every turn to one id.
+  - **Fallback hops:** `sub mode fallback` plus `sub chain anthropic,codex,…` — first
+    hop is primary (can be what's in use, Codex, Gemini, …); later hops run on failure.
+    Tab 4 `[` `]` rotate the first hop.
+  - **Tab 4 map editor:** `e` to edit, type to search, ↑↓ pick, `s` save, `a` add,
+    `d` delete. `llmtrim update` also updates CLIProxyAPI when you use it.
+  - **Images:** blocks smaller than 8×8 (Claude 2×2 placeholders) are omitted before
+    the sidecar so Grok does not 400 `invalid_image`.
+  - **Escape hatch:** `LLMTRIM_CLIPROXY_URL` / `LLMTRIM_CLIPROXY_KEY` point at an
+    existing instance instead of the managed sidecar.
+
 - **Grok flagship is `grok-4.6`.** Default Grok tier preset maps Opus/Sonnet/Fable to
   `grok-4.6` (replacing `grok-4.5`); Haiku stays on `grok-composer-2.5-fast`. The subscription
   catalog no longer lists `grok-4.5`.
