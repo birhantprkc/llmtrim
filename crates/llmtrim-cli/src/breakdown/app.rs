@@ -330,7 +330,8 @@ pub fn run(
                 {
                     let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c');
-                    if ctrl_c || app.handle_key(key.code) {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl_c || app.handle_key(key.code, ctrl) {
                         break;
                     }
                     dirty = true;
@@ -507,7 +508,7 @@ impl App {
     }
 
     /// Handle a key; returns true to quit.
-    fn handle_key(&mut self, code: KeyCode) -> bool {
+    fn handle_key(&mut self, code: KeyCode, ctrl: bool) -> bool {
         // A help overlay swallows the next keypress to dismiss itself.
         if self.show_help {
             self.show_help = false;
@@ -516,7 +517,11 @@ impl App {
         // Map editor owns letters (including q) and ←/→ so search/column focus work.
         #[cfg(feature = "intercept")]
         if self.tab == Tab::Sub && self.sub.capturing_keys() {
-            let _ = self.sub.handle_key(code);
+            if ctrl && matches!(code, KeyCode::Char('s')) {
+                self.sub.save_now();
+            } else {
+                let _ = self.sub.handle_key(code);
+            }
             if self.sub.needs_apply {
                 self.pending_sub_apply = true;
             }
@@ -2575,9 +2580,9 @@ mod tests {
 
         // On Overview, `c` toggles the gauge basis.
         assert!(!app.whole_prompt);
-        app.handle_key(KeyCode::Char('c'));
+        app.handle_key(KeyCode::Char('c'), false);
         assert!(app.whole_prompt);
-        app.handle_key(KeyCode::Char('c'));
+        app.handle_key(KeyCode::Char('c'), false);
         assert!(!app.whole_prompt);
 
         // On the other tabs there is no size figure to reframe, so `c` is a no-op.
@@ -2593,7 +2598,7 @@ mod tests {
         };
         for tab in other {
             app.tab = tab;
-            app.handle_key(KeyCode::Char('c'));
+            app.handle_key(KeyCode::Char('c'), false);
             assert!(
                 !app.whole_prompt,
                 "c must not toggle the basis off Overview"
@@ -2606,7 +2611,7 @@ mod tests {
     fn four_key_and_tab_cycle_reach_sub() {
         let mut app = App::new(None, Duration::from_secs(2));
         assert!(matches!(app.tab, Tab::Overview));
-        app.handle_key(KeyCode::Char('4'));
+        app.handle_key(KeyCode::Char('4'), false);
         assert!(matches!(app.tab, Tab::Sub));
         // Forward cycle: Sub → Overview
         app.cycle_tab();
@@ -2635,14 +2640,14 @@ mod tests {
         // Not installed: `y` is inert — no quit, no action.
         let mut app = App::new(None, Duration::from_secs(2));
         app.tray_available = false;
-        assert!(!app.handle_key(KeyCode::Char('y')));
+        assert!(!app.handle_key(KeyCode::Char('y'), false));
         assert_eq!(app.action, PostAction::None);
 
         // Installed: `y` launches the tray in the background and stays on the dashboard
         // (returns false = no quit) without queuing a post-teardown action. The launch is
         // best-effort — no sibling binary exists in tests, so it no-ops.
         app.tray_available = true;
-        assert!(!app.handle_key(KeyCode::Char('y')));
+        assert!(!app.handle_key(KeyCode::Char('y'), false));
         assert_eq!(app.action, PostAction::None);
     }
 
@@ -2652,14 +2657,14 @@ mod tests {
         let mut ov = sample_overview();
         ov.status.kind = StatusKind::Stale;
         app.overview = Some(ov);
-        app.handle_key(KeyCode::Char('u'));
+        app.handle_key(KeyCode::Char('u'), false);
         assert_eq!(app.action, PostAction::Restart);
 
         let mut app = App::new(None, Duration::from_secs(2));
         let mut ov = sample_overview();
         ov.status.kind = StatusKind::Working;
         app.overview = Some(ov);
-        app.handle_key(KeyCode::Char('u'));
+        app.handle_key(KeyCode::Char('u'), false);
         assert_eq!(app.action, PostAction::Update);
     }
 
@@ -2672,7 +2677,7 @@ mod tests {
         ov.status.kind = StatusKind::Stale;
         ov.update_available = Some("0.3.0".into());
         app.overview = Some(ov);
-        app.handle_key(KeyCode::Char('u'));
+        app.handle_key(KeyCode::Char('u'), false);
         assert_eq!(app.action, PostAction::Update);
     }
 

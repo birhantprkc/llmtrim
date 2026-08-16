@@ -457,16 +457,24 @@ impl SubPanel {
             Ok(()) => {
                 self.map_dirty = false;
                 self.needs_apply = true;
-                self.status = format!("saved {} mappings", map.len());
+                self.search.clear();
+                self.status = format!("saved {} mappings — quit the TUI to apply", map.len());
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
 
+    pub fn save_now(&mut self) {
+        self.save_map();
+    }
+
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
             Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q",
-            Focus::Map => " ← from · → to · type · ↑↓ pick · Tab row · +/- · Enter · w · Esc",
+            Focus::Map if self.map_dirty => {
+                " ← from · → to · ↑↓ pick · Enter pick · w / Ctrl+s SAVE · Esc discard"
+            }
+            Focus::Map => " ← from · → to · ↑↓ pick · Enter pick · w / Ctrl+s save · Esc",
         }
     }
 
