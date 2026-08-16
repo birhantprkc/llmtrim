@@ -51,7 +51,7 @@ enum Col {
 
 fn hop_display(hop: &str) -> &str {
     match hop {
-        "anthropic" | "direct" => "Anthropic",
+        "anthropic" | "direct" => "what's in use",
         "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" => "mapped models",
         "codex" | "chatgpt" | "openai" => "Codex",
         "claude" => "Claude",
@@ -798,11 +798,11 @@ mod tests {
     fn try_chain_sentence_hides_internal_on() {
         assert_eq!(
             format_try_chain(&["anthropic".into(), "on".into()]),
-            "Try Anthropic, then mapped models"
+            "Try what's in use, then mapped models"
         );
         assert_eq!(
             format_try_chain(&["codex".into(), "anthropic".into()]),
-            "Try Codex, then Anthropic"
+            "Try Codex, then what's in use"
         );
     }
 }
