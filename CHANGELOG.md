@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-16
+
 ### Changed
 
 - **`sub` now uses CLIProxyAPI.** `llmtrim sub on` installs and starts
@@ -1634,7 +1636,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.12.6...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/fkiene/llmtrim/compare/v0.12.6...v0.13.0
 [0.12.6]: https://github.com/fkiene/llmtrim/compare/v0.12.5...v0.12.6
 [0.12.5]: https://github.com/fkiene/llmtrim/compare/v0.12.4...v0.12.5
 [0.12.4]: https://github.com/fkiene/llmtrim/compare/v0.12.3...v0.12.4
