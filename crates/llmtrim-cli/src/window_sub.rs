@@ -66,7 +66,14 @@ fn valid(value: &str) -> bool {
         && !value.contains("..")
 }
 fn valid_provider(value: &str) -> bool {
-    crate::reroute::cliproxy::parse_pin_request(value).is_some()
+    #[cfg(feature = "intercept")]
+    {
+        crate::reroute::cliproxy::parse_pin_request(value).is_some()
+    }
+    #[cfg(not(feature = "intercept"))]
+    {
+        matches!(value, "codex" | "kimi" | "grok" | "on") || valid_model_id(value)
+    }
 }
 
 /// A CLIProxyAPI model id that `/sub on <id>` may pin for this window.

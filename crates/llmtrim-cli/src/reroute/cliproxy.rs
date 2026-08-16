@@ -712,7 +712,6 @@ pub fn rewrite(anthropic_body: &Value) -> Result<UpstreamRewrite> {
         body: serde_json::to_vec(&body)?,
         model,
         provider: SubProvider::CliProxy,
-        insecure_http: url.starts_with("http://"),
     })
 }
 

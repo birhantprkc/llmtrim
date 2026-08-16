@@ -41,13 +41,16 @@ pub struct UpstreamRewrite {
     pub body: Vec<u8>,
     pub model: String,
     pub provider: SubProvider,
-    /// CLIProxyAPI is a local HTTP server. First-party translators speak HTTPS.
-    pub insecure_http: bool,
 }
 
 impl UpstreamRewrite {
     pub fn url(&self) -> String {
-        let scheme = if self.insecure_http { "http" } else { "https" };
+        let host = self.host.split(':').next().unwrap_or(self.host.as_str());
+        let scheme = if host == "127.0.0.1" || host == "localhost" {
+            "http"
+        } else {
+            "https"
+        };
         format!("{}://{}{}", scheme, self.host, self.path)
     }
 }
@@ -168,7 +171,6 @@ fn build_upstream_with_model(
         body,
         model,
         provider,
-        insecure_http: false,
     })
 }
 

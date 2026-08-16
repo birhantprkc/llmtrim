@@ -17,21 +17,35 @@ use crate::reroute::{SubProvider, Tier};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingPreset {
     Off,
-    Always,
+    AlwaysCodex,
+    AlwaysKimi,
+    AlwaysGrok,
+    /// What's in use first; on failure, try the saved hop chain.
     Fallback,
 }
 
 impl RoutingPreset {
-    pub const ALL: [RoutingPreset; 3] = [
+    /// Public list kept at 5 variants for semver. The TUI cycles Off / Always / Fallback.
+    pub const ALL: [RoutingPreset; 5] = [
         RoutingPreset::Off,
-        RoutingPreset::Always,
+        RoutingPreset::AlwaysCodex,
+        RoutingPreset::AlwaysKimi,
+        RoutingPreset::AlwaysGrok,
+        RoutingPreset::Fallback,
+    ];
+
+    const CYCLE: [RoutingPreset; 3] = [
+        RoutingPreset::Off,
+        RoutingPreset::AlwaysCodex,
         RoutingPreset::Fallback,
     ];
 
     fn label(self) -> &'static str {
         match self {
             RoutingPreset::Off => "Off",
-            RoutingPreset::Always => "Always",
+            RoutingPreset::AlwaysCodex | RoutingPreset::AlwaysKimi | RoutingPreset::AlwaysGrok => {
+                "Always"
+            }
             RoutingPreset::Fallback => "Fallback",
         }
     }
@@ -149,13 +163,13 @@ impl SubPanel {
     }
 
     pub fn preselect_provider(&mut self, _provider: SubProvider) {
-        self.selected = RoutingPreset::Always;
+        self.selected = RoutingPreset::AlwaysCodex;
         self.status = "highlighted Always — Enter to apply · e to edit map".into();
     }
 
     pub fn seed_export_demo(&mut self) {
-        self.selected = RoutingPreset::Always;
-        self.applied = RoutingPreset::Always;
+        self.selected = RoutingPreset::AlwaysCodex;
+        self.applied = RoutingPreset::AlwaysCodex;
         self.running = true;
         self.rows = vec![
             ("fable".into(), "grok-4.6".into()),
@@ -175,7 +189,7 @@ impl SubPanel {
         if resolve_fallback(&env, file.as_ref()) {
             RoutingPreset::Fallback
         } else {
-            RoutingPreset::Always
+            RoutingPreset::AlwaysCodex
         }
     }
 
@@ -395,7 +409,7 @@ impl SubPanel {
     }
 
     fn cycle_preset(&mut self, dir: i32) {
-        let list = RoutingPreset::ALL;
+        let list = RoutingPreset::CYCLE;
         let pos = list.iter().position(|p| *p == self.selected).unwrap_or(0) as i32;
         let next = (pos + dir).rem_euclid(list.len() as i32) as usize;
         self.selected = list[next];
@@ -457,7 +471,7 @@ impl SubPanel {
                 llmtrim_core::config::disable_sub()?;
                 Ok("reroute off — Anthropic only".into())
             }
-            RoutingPreset::Always => {
+            RoutingPreset::AlwaysCodex | RoutingPreset::AlwaysKimi | RoutingPreset::AlwaysGrok => {
                 cliproxy::ensure_for_existing_user()?;
                 llmtrim_core::config::enable_sub("on")?;
                 llmtrim_core::config::write_sub_mode(false)?;
@@ -535,7 +549,7 @@ impl SubPanel {
         ])
         .split(inner);
 
-        let presets: Vec<Span> = RoutingPreset::ALL
+        let presets: Vec<Span> = RoutingPreset::CYCLE
             .iter()
             .flat_map(|p| {
                 let on = *p == self.selected;
