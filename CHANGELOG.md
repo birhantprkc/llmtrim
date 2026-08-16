@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-16
+
 ### Fixed
 
 - **`ensure` / `sub on` can install CLIProxyAPI again.** The sidecar download used
@@ -1643,7 +1645,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/fkiene/llmtrim/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fkiene/llmtrim/compare/v0.12.6...v0.13.0
 [0.12.6]: https://github.com/fkiene/llmtrim/compare/v0.12.5...v0.12.6
 [0.12.5]: https://github.com/fkiene/llmtrim/compare/v0.12.4...v0.12.5
