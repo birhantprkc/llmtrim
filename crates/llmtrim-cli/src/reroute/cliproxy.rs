@@ -104,6 +104,25 @@ pub const BACKENDS: &[Backend] = &[
 /// Enable sidecar with no model pin (`sub on` / `/sub on`).
 const PASSTHROUGH: &[&str] = &["on", "cliproxy", "cli-proxy", "cli-proxy-api", "cliproxyapi"];
 
+/// A fallback-chain hop: real Anthropic, or a CLIProxyAPI CLI family.
+pub fn parse_hop(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "off" {
+        return None;
+    }
+    if s == "anthropic" || s == "direct" {
+        return Some("anthropic".into());
+    }
+    if is_passthrough_label(&s) {
+        return Some("on".into());
+    }
+    backend_by_alias(&s).map(|b| b.id.to_string())
+}
+
+pub fn is_anthropic_hop(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "anthropic" | "direct")
+}
+
 pub fn is_passthrough_label(raw: &str) -> bool {
     let s = raw.trim().to_ascii_lowercase();
     PASSTHROUGH.contains(&s.as_str())
@@ -1328,6 +1347,11 @@ mod tests {
         );
         assert!(parse_pin_request("off").is_none());
         assert!(parse_pin_request("no spaces allowed here!").is_none());
+        assert_eq!(parse_hop("anthropic").as_deref(), Some("anthropic"));
+        assert_eq!(parse_hop("codex").as_deref(), Some("codex"));
+        assert_eq!(parse_hop("gemini").as_deref(), Some("gemini"));
+        assert_eq!(parse_hop("on").as_deref(), Some("on"));
+        assert!(parse_hop("nope").is_none());
     }
 
     #[test]

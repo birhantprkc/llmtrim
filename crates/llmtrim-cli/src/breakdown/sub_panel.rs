@@ -30,7 +30,7 @@ impl RoutingPreset {
         match self {
             RoutingPreset::Off => "Off",
             RoutingPreset::Always => "Always → CLIProxyAPI",
-            RoutingPreset::Fallback => "Fallback (Anthropic first)",
+            RoutingPreset::Fallback => "Fallback",
         }
     }
 }
@@ -45,6 +45,7 @@ pub struct SubPanel {
     focus: Focus,
     selected: RoutingPreset,
     applied: RoutingPreset,
+    chain: Vec<String>,
     tiers: [Tier; 4],
     chosen: [String; 4],
     catalog: Vec<OfficialModel>,
@@ -71,6 +72,7 @@ impl SubPanel {
             focus: Focus::Presets,
             selected: applied,
             applied,
+            chain: Self::read_chain(),
             tiers: Tier::ALL,
             chosen: [String::new(), String::new(), String::new(), String::new()],
             catalog: Vec::new(),
@@ -94,6 +96,7 @@ impl SubPanel {
             self.selected = applied;
         }
         self.applied = applied;
+        self.chain = Self::read_chain();
         self.running = cliproxy::is_running();
         if self.focus == Focus::Presets && !self.map_dirty {
             self.reload_catalog();
@@ -164,6 +167,8 @@ impl SubPanel {
             Focus::Presets => match code {
                 KeyCode::Left | KeyCode::Char('h') => self.cycle_preset(-1),
                 KeyCode::Right | KeyCode::Char('l') => self.cycle_preset(1),
+                KeyCode::Char('[') => self.rotate_chain(-1),
+                KeyCode::Char(']') => self.rotate_chain(1),
                 KeyCode::Enter => self.apply_selected(),
                 KeyCode::Char('e') => {
                     self.focus = Focus::Map;
@@ -239,6 +244,42 @@ impl SubPanel {
         self.map_dirty = true;
     }
 
+    fn read_chain() -> Vec<String> {
+        if let Ok(v) = std::env::var("LLMTRIM_SUB_CHAIN") {
+            return v.split(',').filter_map(cliproxy::parse_hop).collect();
+        }
+        load_config_file()
+            .as_ref()
+            .and_then(|v| v.get("sub"))
+            .and_then(|v| v.get("chain"))
+            .map(|v| match v {
+                toml::Value::Array(items) => items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .filter_map(cliproxy::parse_hop)
+                    .collect(),
+                toml::Value::String(s) => s.split(',').filter_map(cliproxy::parse_hop).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    fn rotate_chain(&mut self, dir: i32) {
+        if self.selected != RoutingPreset::Fallback {
+            self.selected = RoutingPreset::Fallback;
+        }
+        if self.chain.is_empty() {
+            self.chain = vec!["anthropic".into(), "on".into()];
+        }
+        let n = self.chain.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let k = dir.rem_euclid(n) as usize;
+        self.chain.rotate_left(k);
+        self.status = format!("chain {}", self.chain.join(" → "));
+    }
+
     fn apply_selected(&mut self) {
         match self.apply_preset(self.selected) {
             Ok(msg) => {
@@ -268,7 +309,13 @@ impl SubPanel {
                 cliproxy::ensure_for_existing_user()?;
                 llmtrim_core::config::enable_sub("on")?;
                 llmtrim_core::config::write_sub_mode(true)?;
-                Ok("fallback — Anthropic first, then CLIProxyAPI".into())
+                let chain = if self.chain.is_empty() {
+                    vec!["anthropic".into(), "on".into()]
+                } else {
+                    self.chain.clone()
+                };
+                llmtrim_core::config::write_sub_chain(&chain)?;
+                Ok(format!("fallback · {}", chain.join(" → ")))
             }
         }
     }
@@ -292,7 +339,7 @@ impl SubPanel {
 
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
-            Focus::Presets => " Tab tabs · ←→ mode · ⏎ apply · e map · r refresh · q",
+            Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · ⏎ apply · e map · r refresh · q",
             Focus::Map => " ↑↓ tier · type search · ←→ model · w save · Esc back · q",
         }
     }
@@ -339,6 +386,11 @@ impl SubPanel {
                 "{sidecar} · {} official models · * = applied",
                 self.catalog.len()
             )),
+            Line::from(if self.selected == RoutingPreset::Fallback {
+                format!("chain {}", if self.chain.is_empty() { "anthropic → on".into() } else { self.chain.join(" → ") })
+            } else {
+                String::new()
+            }),
         ]);
         f.render_widget(header, chunks[0]);
 

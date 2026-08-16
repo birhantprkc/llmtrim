@@ -477,12 +477,13 @@ mod imp {
     /// provider's session header).
     #[derive(Clone)]
     struct FallbackInfo {
-        /// Providers to try, in order. Never empty (the arming site drops the fallback otherwise).
-        providers: Vec<crate::reroute::SubProvider>,
+        /// Hops to try, in order (`anthropic`, `codex`, `gemini`, …).
+        providers: Vec<String>,
         anthropic_body: Vec<u8>,
         session_id: Option<String>,
     }
 
+    #[allow(dead_code)]
     struct FallbackAttempt {
         provider: crate::reroute::SubProvider,
         model: String,
@@ -1821,8 +1822,10 @@ mod imp {
         /// at construction. `None` = normal transparent compress-and-forward. When set, intercepted
         /// Anthropic `/v1/messages` traffic is rewritten to the CLIProxyAPI sidecar.
         sub: Option<crate::reroute::SubProvider>,
-        /// Ordered fallback providers. The active `sub` is used when this is empty.
-        sub_chain: Arc<Vec<crate::reroute::SubProvider>>,
+        /// Ordered fallback hops (`anthropic`, `codex`, `gemini`, …). First hop is primary.
+        sub_chain: Arc<Vec<String>>,
+        /// Per-request CLIProxyAPI CLI when fallback primary is not Anthropic.
+        request_backend: Option<String>,
         /// Tier→model overrides for the active `sub` (from `[sub.<provider>.tiers]`); empty = use
         /// the built-in preset. Shared across per-request handler clones.
         sub_tiers: Arc<std::collections::BTreeMap<String, String>>,
@@ -1997,6 +2000,24 @@ mod imp {
     }
 
     impl Interceptor {
+        fn fallback_hops(&self) -> Vec<String> {
+            if !self.sub_chain.is_empty() {
+                return (*self.sub_chain).clone();
+            }
+            let mut hops = vec!["anthropic".to_string()];
+            if let Some(sub) = self.sub {
+                let hop = if sub == crate::reroute::SubProvider::CliProxy {
+                    "on".to_string()
+                } else {
+                    sub.as_str().to_string()
+                };
+                if !hops.contains(&hop) {
+                    hops.push(hop);
+                }
+            }
+            hops
+        }
+
         /// Body of `handle_request`, factored out so tests can call it directly without
         /// constructing a `hudsucker::HttpContext` (which is `#[non_exhaustive]` and
         /// cannot be instantiated outside the hudsucker crate).
@@ -2038,7 +2059,7 @@ mod imp {
             // `ANTHROPIC_AUTH_TOKEN=llmtrim-sub`. Non-messages probes must not reach Anthropic
             // (401 → "Please run /login"). Messages that aren't rerouted (e.g. window `/sub off`)
             // must not reach Anthropic either — return a clear llmtrim error instead.
-            let mut fallback_arm: Option<(Vec<crate::reroute::SubProvider>, Option<String>)> = None;
+            let mut fallback_arm: Option<(Vec<String>, Option<String>)> = None;
             // A generated custom agent can carry one trusted, standalone system marker. Read and
             // remove it before every later stage so it never becomes prompt/cache/capture content.
             let (req, request_route) = if matches!(provider, Some(ProviderKind::Anthropic))
@@ -2108,20 +2129,25 @@ mod imp {
                     && req.method() == Method::POST
                     && path_kind == AnthropicApiPath::Messages
                 {
-                    // A chain is enough to arm the fallback: `sub` selects who serves *every* turn
-                    // in `always` mode, but in fallback mode the chain is the whole answer, so
-                    // `sub = off` + a chain is a valid configuration.
-                    let mut providers = self.sub_chain.as_ref().clone();
-                    if providers.is_empty() {
-                        providers.extend(self.sub);
-                    }
-                    if !providers.is_empty() {
+                    let hops = self.fallback_hops();
+                    if !hops.is_empty() {
                         let session_id = req
                             .headers()
                             .get("x-claude-code-session-id")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
-                        fallback_arm = Some((providers, session_id));
+                        let (first, rest) = hops.split_first().unwrap();
+                        fallback_arm = Some((rest.to_vec(), session_id));
+                        if !crate::reroute::cliproxy::is_anthropic_hop(first) {
+                            self.request_backend = Some(first.clone());
+                            return self
+                                .reroute_messages(
+                                    req,
+                                    crate::reroute::SubProvider::CliProxy,
+                                    window_model_pin,
+                                )
+                                .await;
+                        }
                     }
                 }
                 // Dummy credential handling (token is global in settings.json, so it still
@@ -2649,7 +2675,23 @@ mod imp {
                     sub.as_str()
                 };
                 let mut tiers = llmtrim_core::config::sub_tiers_for(key);
-                if let Some(win) = crate::window_sub::lookup(session_id.as_deref())
+                if let Some(hop) = self.request_backend.take() {
+                    if let Some(backend) = crate::reroute::cliproxy::backend_by_alias(&hop) {
+                        let catalog = crate::reroute::cliproxy::official_models();
+                        let mapped =
+                            crate::reroute::cliproxy::default_tier_map(Some(backend), &catalog);
+                        if !mapped.is_empty() {
+                            tiers = mapped;
+                        }
+                    } else if hop != "on" {
+                        let catalog = crate::reroute::cliproxy::official_models();
+                        if let Some(id) =
+                            crate::reroute::cliproxy::expand_pin(&hop, &catalog.iter().map(|m| m.as_live()).collect::<Vec<_>>())
+                        {
+                            translate_value["model"] = serde_json::Value::String(id);
+                        }
+                    }
+                } else if let Some(win) = crate::window_sub::lookup(session_id.as_deref())
                     && let crate::window_sub::Intent::Enabled { provider } = win
                     && let Some(backend) = crate::reroute::cliproxy::backend_by_alias(&provider)
                 {
@@ -3535,7 +3577,6 @@ mod imp {
             mut pending: Pending,
             fb: FallbackInfo,
         ) -> Response<Body> {
-            use crate::reroute::sse::{AnthropicSseEncoder, ReduceEvent};
             let Some(mut anthropic) = std::str::from_utf8(&fb.anthropic_body)
                 .ok()
                 .and_then(|t| serde_json::from_str::<Value>(t).ok())
@@ -3553,123 +3594,100 @@ mod imp {
                 .to_string();
             apply_sub_effort(&mut anthropic, self.sub_effort.as_deref());
 
-            let mut providers = Vec::new();
-            for provider in fb.providers.iter().copied() {
-                if !providers.contains(&provider) {
-                    providers.push(provider);
+            let mut hops = Vec::new();
+            for hop in &fb.providers {
+                if !hops.contains(hop) {
+                    hops.push(hop.clone());
                 }
             }
-            // One wall-clock budget for the whole chain: per-provider backoff × N providers can
-            // otherwise outlast the client's own timeout, and a client that has already given up
-            // makes every further attempt pure waste (and pure spend).
             let deadline = std::time::Instant::now() + FALLBACK_CHAIN_BUDGET;
             let mut failures = Vec::new();
-            for provider in providers {
-                let attempt = match self
-                    .fallback_attempt(
-                        provider,
-                        &anthropic,
-                        None,
-                        fb.session_id.as_deref(),
-                        deadline,
-                    )
-                    .await
-                {
-                    Ok(attempt) => attempt,
-                    Err(error) => {
-                        if crate::reroute::context_limit::is_context_limit_text(&error) {
-                            crate::reroute::continuation::clear_continuation(
-                                fb.session_id.as_deref(),
-                            );
-                            crate::reroute::context_limit::mark_must_compact(
-                                fb.session_id.as_deref(),
-                            );
-                            return context_limit_guard_response(
-                                Some(pending),
-                                &self.ledger,
-                                &self.breakdown_ledger,
-                            );
+            for hop in hops {
+                if std::time::Instant::now() >= deadline {
+                    failures.push("fallback budget exhausted".into());
+                    break;
+                }
+                if crate::reroute::cliproxy::is_anthropic_hop(&hop) {
+                    if let Some(orig) = pending.original.as_ref()
+                        && let Some(res) = replay_original(orig, self.upstream_proxy.as_deref())
+                    {
+                        if res.status().as_u16() < 400 {
+                            return res;
                         }
-                        failures.push(format!("{}: {error}", provider.as_str()));
+                        failures.push(format!("anthropic: HTTP {}", res.status()));
+                        continue;
+                    }
+                    failures.push("anthropic: replay unavailable".into());
+                    continue;
+                }
+                let mut body = anthropic.clone();
+                if let Some(backend) = crate::reroute::cliproxy::backend_by_alias(&hop) {
+                    let catalog = crate::reroute::cliproxy::official_models();
+                    let map = crate::reroute::cliproxy::default_tier_map(Some(backend), &catalog);
+                    let mapped = crate::reroute::resolve_model(
+                        crate::reroute::SubProvider::CliProxy,
+                        &client_model,
+                        &map,
+                    );
+                    if mapped != client_model {
+                        body["model"] = serde_json::Value::String(mapped);
+                    }
+                } else if hop == "on" {
+                    let map = llmtrim_core::config::sub_tiers_for("on");
+                    let mapped = crate::reroute::resolve_model(
+                        crate::reroute::SubProvider::CliProxy,
+                        &client_model,
+                        &map,
+                    );
+                    if mapped != client_model {
+                        body["model"] = serde_json::Value::String(mapped);
+                    }
+                }
+                let rewrite = match crate::reroute::cliproxy::rewrite(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        failures.push(format!("{hop}: {e}"));
                         continue;
                     }
                 };
-                let mut reducer =
-                    crate::reroute::StreamReducer::new(attempt.provider, &attempt.model);
-                let mut encoder = AnthropicSseEncoder::new(&client_model);
-                let mut output = String::new();
-                let mut stream_error = None;
-                let mut committed = false;
-                let mut events = reducer.push(&attempt.body);
-                events.extend(reducer.finish());
-                for event in &events {
-                    match event {
-                        ReduceEvent::Error { message } if !committed => {
-                            stream_error = Some(message.clone());
-                        }
-                        ReduceEvent::Error { .. } | ReduceEvent::Finish { .. } => {}
-                        _ => committed = true,
-                    }
-                    record_codex_continuation(
-                        event,
-                        &mut reducer,
-                        attempt.provider,
-                        attempt.logical_body.as_ref(),
-                        fb.session_id.as_deref(),
-                    );
-                    encoder.encode(event, &mut output);
-                }
-                if let Some(error) = stream_error {
-                    crate::reroute::continuation::clear_continuation(fb.session_id.as_deref());
-                    // Pre-output context-limit only — never latch after client-visible content.
-                    if crate::reroute::context_limit::is_context_limit_text(&error) && !committed {
-                        crate::reroute::context_limit::mark_must_compact(fb.session_id.as_deref());
-                        return context_limit_guard_response(
+                match self
+                    .reissue_reroute(&rewrite.url(), rewrite.headers.clone(), Arc::new(rewrite.body.clone()))
+                    .await
+                {
+                    Some((status, raw, _)) if (200..300).contains(&status) => {
+                        pending.model = Some(rewrite.model.clone());
+                        pending.reroute = Some(RerouteInfo {
+                            provider: crate::reroute::SubProvider::CliProxy,
+                            model: rewrite.model.clone(),
+                            client_model: client_model.clone(),
+                            replay: None,
+                            logical_body: None,
+                            session_id: fb.session_id.clone(),
+                            anthropic_snapshot: Some(body),
+                            passthrough: true,
+                        });
+                        crate::reroute::context_limit::record_accepted(
+                            fb.session_id.as_deref(),
+                            &anthropic,
+                        );
+                        let acc = Arc::new(Mutex::new(raw.clone()));
+                        let _finalize = Finalize::new(
+                            acc,
                             Some(pending),
-                            &self.ledger,
-                            &self.breakdown_ledger,
+                            self.ledger.clone(),
+                            self.breakdown_ledger.clone(),
+                        );
+                        return buffered_response(
+                            status,
+                            Some("text/event-stream".to_string()),
+                            raw,
                         );
                     }
-                    // Content already committed: do not surface as a clean next-provider attempt
-                    // (partial answer may already be in `output`); treat as terminal for this
-                    // provider and continue the chain only when nothing was committed.
-                    if committed {
-                        failures.push(format!("{}: {error}", attempt.provider.as_str()));
-                        continue;
-                    }
-                    failures.push(format!("{}: {error}", attempt.provider.as_str()));
-                    continue;
+                    Some((status, _, _)) => failures.push(format!("{hop}: HTTP {status}")),
+                    None => failures.push(format!("{hop}: no response")),
                 }
-                encoder.finish_if_open(&mut output);
-                pending.model = Some(attempt.model.clone());
-                pending.reroute = Some(RerouteInfo {
-                    provider: attempt.provider,
-                    model: attempt.model,
-                    client_model: client_model.clone(),
-                    replay: None,
-                    logical_body: attempt.logical_body,
-                    session_id: fb.session_id.clone(),
-                    anthropic_snapshot: Some(anthropic.clone()),
-                    passthrough: attempt.provider == crate::reroute::SubProvider::CliProxy,
-                });
-                if let Some(info) = pending.reroute.as_ref()
-                    && let Some(snap) = info.anthropic_snapshot.as_ref()
-                {
-                    crate::reroute::context_limit::record_accepted(
-                        info.session_id.as_deref(),
-                        snap,
-                    );
-                }
-                let acc = Arc::new(Mutex::new(output.clone().into_bytes()));
-                let _finalize = Finalize::new(
-                    acc,
-                    Some(pending),
-                    self.ledger.clone(),
-                    self.breakdown_ledger.clone(),
-                );
-                return sse_response(output);
             }
-            self.fallback_error(
+                        self.fallback_error(
                 pending,
                 &client_model,
                 &format!(
@@ -5388,18 +5406,17 @@ mod imp {
                     .sub_chain
                     .iter()
                     .filter_map(|p| {
-                        let parsed = crate::reroute::SubProvider::parse(p);
+                        let parsed = crate::reroute::cliproxy::parse_hop(p);
                         if parsed.is_none() {
-                            // Silently dropping it would leave a typo'd chain quietly shorter than
-                            // the user configured — and the fallback they think they have missing.
                             eprintln!(
-                                "llmtrim: unknown provider '{p}' in the sub fallback chain — ignored (expected on|cliproxy)"
+                                "llmtrim: unknown hop '{p}' in the sub fallback chain — ignored (anthropic|codex|claude|gemini|grok|kimi|vertex|qwen|copilot)"
                             );
                         }
                         parsed
                     })
                     .collect(),
             ),
+            request_backend: None,
             sub_tiers: Arc::new(RuntimeConfig::get().sub_tiers.clone()),
             sub_fallback: RuntimeConfig::get().sub_fallback,
             sub_effort: RuntimeConfig::get().sub_effort.clone(),
@@ -7429,6 +7446,7 @@ mod imp {
                 sub_fallback: false,
                 sub_effort: None,
                 compact_models: Arc::new(vec![]),
+                request_backend: None,
             };
             (handler, rx)
         }

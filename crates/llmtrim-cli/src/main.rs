@@ -1314,13 +1314,19 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 if raw.is_empty() {
                     continue;
                 }
-                let p = parse(raw)?;
-                if !chain.contains(&p.as_str().to_string()) {
-                    chain.push(p.as_str().to_string());
+                let Some(hop) = llmtrim::reroute::cliproxy::parse_hop(raw) else {
+                    anyhow::bail!(
+                        "unknown hop '{raw}' (anthropic|codex|claude|gemini|grok|kimi|vertex|qwen|copilot)"
+                    );
+                };
+                if !chain.contains(&hop) {
+                    chain.push(hop);
                 }
             }
             if chain.is_empty() {
-                anyhow::bail!("fallback chain is empty (expected codex,kimi)");
+                anyhow::bail!(
+                    "fallback chain is empty (e.g. anthropic,codex or codex,anthropic)"
+                );
             }
             llmtrim_core::config::write_sub_chain(&chain)?;
             println!("Fallback chain: {}.", chain.join(" -> "));
