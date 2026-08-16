@@ -6,7 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+};
 
 use super::palette;
 use crate::reroute::cliproxy::{self, OfficialModel};
@@ -45,6 +47,13 @@ enum Focus {
 enum Col {
     From,
     To,
+}
+
+fn side_label(col: Col) -> &'static str {
+    match col {
+        Col::From => "input",
+        Col::To => "output",
+    }
 }
 
 pub struct SubPanel {
@@ -568,39 +577,38 @@ impl SubPanel {
         f.render_widget(table, chunks[1]);
 
         if self.focus == Focus::Map {
-            let q = if self.search.is_empty() {
-                "_".to_string()
+            let title = if self.search.is_empty() {
+                format!("{} · {} models", side_label(self.col), self.filtered.len())
             } else {
-                self.search.clone()
+                format!("\"{}\" · {} matches", self.search, self.filtered.len())
             };
-            let mut lines = vec![Line::from(Span::styled(
-                q,
-                Style::default().add_modifier(Modifier::BOLD),
-            ))];
-            let window = 6usize;
-            let start = self.filter_idx.saturating_sub(1);
-            let end = (start + window).min(self.filtered.len());
-            for (i, id) in self.filtered[start..end].iter().enumerate() {
-                let idx = start + i;
-                let mark = if idx == self.filter_idx { "* " } else { "  " };
-                let style = if idx == self.filter_idx {
+            let items: Vec<ListItem> = if self.filtered.is_empty() {
+                vec![ListItem::new("(no matches)")]
+            } else {
+                self.filtered
+                    .iter()
+                    .map(|id| ListItem::new(id.as_str()))
+                    .collect()
+            };
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(palette::frame()))
+                        .title(title),
+                )
+                .highlight_style(
                     Style::default()
                         .fg(palette::accent())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                lines.push(Line::from(Span::styled(format!("{mark}{id}"), style)));
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                )
+                .highlight_symbol("› ");
+            let mut state = ListState::default();
+            if !self.filtered.is_empty() {
+                state.select(Some(self.filter_idx.min(self.filtered.len() - 1)));
             }
-            if self.filtered.is_empty() {
-                lines.push(Line::from("  (no matches)"));
-            } else if end < self.filtered.len() {
-                lines.push(Line::from(format!(
-                    "  … {} more",
-                    self.filtered.len() - end
-                )));
-            }
-            f.render_widget(Paragraph::new(lines), chunks[2]);
+            f.render_stateful_widget(list, chunks[2], &mut state);
         }
 
         let hint = if self.focus == Focus::Map {
