@@ -265,8 +265,10 @@ impl SubPanel {
                     self.refilter();
                     self.status = "editing output (CLIProxyAPI model)".into();
                 }
-                KeyCode::Up => self.move_row(-1),
-                KeyCode::Down => self.move_row(1),
+                KeyCode::Up => self.move_pick(-1),
+                KeyCode::Down => self.move_pick(1),
+                KeyCode::Tab => self.move_row(1),
+                KeyCode::BackTab => self.move_row(-1),
                 KeyCode::Char('+') | KeyCode::Insert => self.add_row(),
                 KeyCode::Char('-') | KeyCode::Delete => self.remove_row(),
                 KeyCode::Char('w') if self.search.is_empty() => self.save_map(),
@@ -337,13 +339,16 @@ impl SubPanel {
 
     fn apply_search_to_cell(&mut self) {
         self.refilter();
-        let value = self
-            .filtered
-            .first()
-            .cloned()
-            .unwrap_or_else(|| self.search.clone());
         self.filter_idx = 0;
-        self.set_cell(value);
+        self.set_cell(self.search.clone());
+    }
+
+    fn move_pick(&mut self, dir: i32) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let n = self.filtered.len() as i32;
+        self.filter_idx = (self.filter_idx as i32 + dir).rem_euclid(n) as usize;
     }
 
     fn cycle_preset(&mut self, dir: i32) {
@@ -452,7 +457,7 @@ impl SubPanel {
     pub fn help_keys(&self) -> &'static str {
         match self.focus {
             Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q",
-            Focus::Map => " ← from · → to · ↑↓ row · type search · +/- row · w save · Esc",
+            Focus::Map => " ← from · → to · type · ↑↓ pick · Tab row · +/- · Enter · w · Esc",
         }
     }
 
@@ -468,9 +473,11 @@ impl SubPanel {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        let suggest_h = if self.focus == Focus::Map { 8 } else { 0 };
         let chunks = Layout::vertical([
             Constraint::Length(4),
-            Constraint::Min(8),
+            Constraint::Min(4),
+            Constraint::Length(suggest_h),
             Constraint::Length(2),
         ])
         .split(inner);
@@ -559,6 +566,42 @@ impl SubPanel {
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             );
         f.render_widget(table, chunks[1]);
+
+        if self.focus == Focus::Map {
+            let q = if self.search.is_empty() {
+                "_".to_string()
+            } else {
+                self.search.clone()
+            };
+            let mut lines = vec![Line::from(Span::styled(
+                q,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            let window = 6usize;
+            let start = self.filter_idx.saturating_sub(1);
+            let end = (start + window).min(self.filtered.len());
+            for (i, id) in self.filtered[start..end].iter().enumerate() {
+                let idx = start + i;
+                let mark = if idx == self.filter_idx { "* " } else { "  " };
+                let style = if idx == self.filter_idx {
+                    Style::default()
+                        .fg(palette::accent())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(format!("{mark}{id}"), style)));
+            }
+            if self.filtered.is_empty() {
+                lines.push(Line::from("  (no matches)"));
+            } else if end < self.filtered.len() {
+                lines.push(Line::from(format!(
+                    "  … {} more",
+                    self.filtered.len() - end
+                )));
+            }
+            f.render_widget(Paragraph::new(lines), chunks[2]);
+        }
 
         let hint = if self.focus == Focus::Map {
             let n = self.filtered.len();
