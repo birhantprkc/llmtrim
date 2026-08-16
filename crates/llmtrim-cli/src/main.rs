@@ -472,9 +472,10 @@ enum AgentsCmd {
 /// Subscription reroute: send Claude Code traffic to another subscription's backend.
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Open the interactive tier→model mapping editor for a provider (codex|kimi|grok).
+    /// Open tab 4 of `llmtrim status` to edit the input→output model map.
     Setup {
-        /// Provider to edit: codex|kimi|grok.
+        /// Ignored (kept so old `sub setup grok` still opens the map). Any CLIProxyAPI CLI is fine.
+        #[arg(default_value = "on")]
         provider: String,
     },
     /// Enable reroute through CLIProxyAPI (installs + starts the sidecar).
@@ -483,13 +484,13 @@ enum SubCmd {
     /// `sub use` and `sub start` are accepted aliases.
     #[command(visible_alias = "use", alias = "start")]
     On {
-        /// Optional CLIProxyAPI model id to pin. Omit to pass Claude model ids through.
+        /// Optional CLI (`gemini`, `codex`, …) or model id. Writes the input→output map.
         provider: Option<String>,
         /// Don't restart a running interceptor to apply the change (just print the hint).
         #[arg(long)]
         no_restart: bool,
     },
-    /// Disable reroute (sets `sub = off`); traffic goes back to Anthropic with compression only.
+    /// Disable reroute (`sub = off`); traffic stays on what's in use, compression only.
     ///
     /// `sub stop` is an accepted alias.
     #[command(alias = "stop")]
@@ -498,8 +499,8 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Set the reroute mode: `always` (reroute every turn) or `fallback` (use the ordered
-    /// subscription chain only when Anthropic cannot serve the turn).
+    /// Set the reroute mode: `always` (every turn uses the map) or `fallback` (try hops
+    /// in `sub chain` order when the current hop cannot serve the turn).
     Mode {
         /// `always` or `fallback`.
         mode: String,
@@ -507,16 +508,15 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Set the ordered providers used by `sub mode fallback` (for example `codex,kimi,grok`).
+    /// Set the fallback hop list (for example `anthropic,codex` or `gemini,anthropic`).
     Chain {
-        /// Comma-separated providers in try order: codex,kimi,grok.
+        /// Comma-separated hops: anthropic,codex,claude,gemini,grok,kimi,vertex,qwen,copilot.
         providers: String,
         /// Don't restart a running interceptor to apply the change.
         #[arg(long)]
         no_restart: bool,
     },
-    /// Override the Codex reasoning effort on every rerouted request. By default the reroute honors
-    /// the effort Claude Code asks for per turn; this forces one level instead (Kimi ignores it).
+    /// Override reasoning effort on rerouted requests. Default: honor what Claude Code asks.
     Effort {
         /// `none` | `low` | `medium` | `high` | `xhigh` (`max` = `xhigh`).
         level: String,
@@ -524,10 +524,10 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Map one incoming model (a Claude tier `opus|sonnet|haiku|fable`, or an exact model id) to a
-    /// provider model. Non-interactive form of `setup`, for scripts and the tray.
+    /// Map one incoming model (tier `opus|sonnet|haiku|fable`, or an exact id) to a
+    /// CLIProxyAPI model. Non-interactive form of `setup`.
     Map {
-        /// Provider whose mapping to edit: codex|kimi|grok.
+        /// Map key: `on` (live map) or a legacy name. Prefer `on`.
         provider: String,
         /// Incoming model or tier name to map from.
         from: String,
@@ -537,9 +537,9 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Remove one mapping entry (falls back to the preset default for that model).
+    /// Remove one mapping entry from the live map.
     Unmap {
-        /// Provider whose mapping to edit: codex|kimi|grok.
+        /// Map key: `on` (live map) or a legacy name. Prefer `on`.
         provider: String,
         /// Incoming model or tier name to unmap.
         from: String,
@@ -547,9 +547,9 @@ enum SubCmd {
         #[arg(long)]
         no_restart: bool,
     },
-    /// List the provider's candidate models (for autocompletion). `--json` for machine output.
+    /// List CLIProxyAPI models (live sidecar, else the official catalog). `--json` for machines.
     Models {
-        /// Provider: codex|kimi|grok.
+        /// Unused; kept so `sub models grok` still lists the sidecar.
         provider: String,
         /// Emit a JSON array of model ids.
         #[arg(long)]
@@ -561,9 +561,9 @@ enum SubCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sign in / out of a subscription (`llmtrim sub auth codex login`).
+    /// Open the CLIProxyAPI TUI to sign in (`llmtrim sub auth`).
     Auth {
-        /// Provider: codex|kimi|grok.
+        /// Unused; sign-in is the sidecar TUI.
         provider: String,
         #[command(subcommand)]
         action: AuthAction,
@@ -1066,12 +1066,8 @@ fn apply_sub_change(no_restart: bool) {
 /// the provider reroute is currently pointed at — a change to some other provider's mapping is
 /// inert until you switch to it, so there's no reason to disturb a live session.
 #[cfg(feature = "intercept")]
-fn apply_sub_map_change(edited: llmtrim::reroute::SubProvider, no_restart: bool) {
-    let active = llmtrim_core::config::RuntimeConfig::get()
-        .sub
-        .as_deref()
-        .and_then(llmtrim::reroute::SubProvider::parse);
-    if active == Some(edited) {
+fn apply_sub_map_change(no_restart: bool) {
+    if llmtrim_core::config::sub_always_on() {
         apply_sub_change(no_restart);
     }
 }
@@ -1187,35 +1183,43 @@ fn run_agents(action: AgentsCmd) -> Result<()> {
 #[cfg(feature = "intercept")]
 fn run_sub(action: SubCmd) -> Result<()> {
     use llmtrim::reroute::{SubProvider, Tier, default_codex_tier_model};
-    let parse = |p: &str| {
+    let parse = |p: &str| -> anyhow::Result<String> {
+        let p = p.trim();
+        if p.is_empty()
+            || llmtrim::reroute::cliproxy::is_passthrough_label(p)
+            || llmtrim::reroute::cliproxy::parse_hop(p).is_some()
+        {
+            return Ok("on".into());
+        }
         SubProvider::parse(p)
-            .ok_or_else(|| anyhow::anyhow!("unknown provider '{p}' (codex|kimi|grok)"))
+            .map(|x| x.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown target '{p}' (on|anthropic|codex|claude|gemini|grok|kimi|vertex|qwen|copilot)"
+                )
+            })
     };
     match action {
-        SubCmd::Setup { provider } => {
-            let p = parse(&provider)?;
-            // The interactive editor lives in `llmtrim status` tab 4 (Sub). Prefer that
-            // surface so mode + provider routing share one TUI; keep the standalone
-            // mapping editor as a fallback when status isn't available.
+        SubCmd::Setup { provider: _ } => {
+            // The interactive editor lives in `llmtrim status` tab 4 (Sub).
             #[cfg(all(feature = "breakdown", feature = "intercept"))]
             {
                 use std::io::IsTerminal;
                 if std::io::stdout().is_terminal() {
-                    llmtrim::breakdown::app::open_on_sub_next(Some(p));
+                    llmtrim::breakdown::app::open_on_sub_next(None);
                     // Same live dashboard as `llmtrim status`, focused on the Sub tab
                     // with the named provider highlighted (Enter applies).
                     return run_monitor(2, false, false, false, false, false, false, false);
                 }
                 // Non-TTY: fall through to the headless mapping editor.
-                llmtrim::reroute::tui::run(p)
+                llmtrim::reroute::tui::run(SubProvider::CliProxy)
             }
             #[cfg(all(feature = "breakdown", not(feature = "intercept")))]
             {
-                llmtrim::reroute::tui::run(p)
+                llmtrim::reroute::tui::run(SubProvider::CliProxy)
             }
             #[cfg(not(feature = "breakdown"))]
             {
-                let _ = p;
                 anyhow::bail!("the mapping editor needs the `breakdown` feature")
             }
         }
@@ -1362,10 +1366,10 @@ fn run_sub(action: SubCmd) -> Result<()> {
             to,
             no_restart,
         } => {
-            let p = parse(&provider)?;
-            llmtrim_core::config::write_sub_map_entry(p.as_str(), &from, &to)?;
-            println!("Mapped {from} -> {to} for {}.", p.as_str());
-            apply_sub_map_change(p, no_restart);
+            let key = parse(&provider)?;
+            llmtrim_core::config::write_sub_map_entry(&key, &from, &to)?;
+            println!("Mapped {from} -> {to}.");
+            apply_sub_map_change(no_restart);
             Ok(())
         }
         SubCmd::Unmap {
@@ -1373,19 +1377,23 @@ fn run_sub(action: SubCmd) -> Result<()> {
             from,
             no_restart,
         } => {
-            let p = parse(&provider)?;
-            llmtrim_core::config::remove_sub_map_entry(p.as_str(), &from)?;
-            println!(
-                "Unmapped {from} for {} (back to the preset default).",
-                p.as_str()
-            );
-            apply_sub_map_change(p, no_restart);
+            let key = parse(&provider)?;
+            llmtrim_core::config::remove_sub_map_entry(&key, &from)?;
+            println!("Unmapped {from}.");
+            apply_sub_map_change(no_restart);
             Ok(())
         }
         SubCmd::Models { json, .. } => {
-            let models = llmtrim::reroute::cliproxy::list_models().map_err(|e| {
-                anyhow::anyhow!("{e} — is CLIProxyAPI running? Try `llmtrim sub on`.")
-            })?;
+            let models = match llmtrim::reroute::cliproxy::list_models() {
+                Ok(m) if !m.is_empty() => m,
+                Ok(_) | Err(_) => llmtrim::reroute::cliproxy::official_models()
+                    .into_iter()
+                    .map(|m| llmtrim::reroute::cliproxy::Model {
+                        id: m.id,
+                        owned_by: m.owned_by,
+                    })
+                    .collect(),
+            };
             if json {
                 println!(
                     "{}",
@@ -1416,30 +1424,7 @@ fn run_sub(action: SubCmd) -> Result<()> {
                 // One effective map: the four resolved Codex tiers, then every configured entry
                 // laid over them (a configured tier wins, a free-form `model-id -> model` adds a
                 // row). One key, not a resolved/raw pair the caller has to reconcile.
-                let mut mapping: std::collections::BTreeMap<String, String> = match active {
-                    Some(SubProvider::Codex) => Tier::ALL
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.as_str().to_string(),
-                                default_codex_tier_model(*t).to_string(),
-                            )
-                        })
-                        .collect(),
-                    Some(SubProvider::Grok) => Tier::ALL
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.as_str().to_string(),
-                                llmtrim::reroute::default_grok_tier_model(*t).to_string(),
-                            )
-                        })
-                        .collect(),
-                    _ => std::collections::BTreeMap::new(),
-                };
-                for (k, v) in &cfg.sub_tiers {
-                    mapping.insert(k.clone(), v.clone());
-                }
+                let mapping = llmtrim_core::config::sub_tiers_for("on");
                 let skip_login = llmtrim_core::config::sub_skip_anthropic_login();
                 let claude_auth = match llmtrim::statusline::sub_auth_env_presence() {
                     llmtrim::statusline::SubAuthEnvPresence::Ours => "dummy",
