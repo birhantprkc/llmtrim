@@ -686,6 +686,8 @@ pub fn rewrite(anthropic_body: &Value) -> Result<UpstreamRewrite> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+    let mut body = anthropic_body.clone();
+    strip_tiny_images(&mut body);
     let key = api_key()?;
     let url = base_url();
     let (host, path) = split_base_url(&url)?;
@@ -697,11 +699,125 @@ pub fn rewrite(anthropic_body: &Value) -> Result<UpstreamRewrite> {
             ("x-api-key".into(), key),
             ("content-type".into(), "application/json".into()),
         ],
-        body: serde_json::to_vec(anthropic_body)?,
+        body: serde_json::to_vec(&body)?,
         model,
         provider: SubProvider::CliProxy,
         insecure_http: url.starts_with("http://"),
     })
+}
+
+/// Grok (and some others) reject images under 8×8. Drop those blocks so a 2×2
+/// placeholder from Claude Code does not 400 the whole turn.
+const MIN_IMAGE_EDGE: u32 = 8;
+
+pub(crate) fn strip_tiny_images(body: &mut Value) -> usize {
+    let mut n = 0;
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in msgs {
+            n += strip_tiny_in_content(msg.get_mut("content"));
+        }
+    }
+    n
+}
+
+fn strip_tiny_in_content(content: Option<&mut Value>) -> usize {
+    let Some(content) = content else {
+        return 0;
+    };
+    match content {
+        Value::Array(blocks) => {
+            let mut n = 0;
+            let mut i = 0;
+            while i < blocks.len() {
+                n += strip_tiny_in_content(blocks[i].get_mut("content"));
+                if is_tiny_image(&blocks[i]) {
+                    blocks[i] = serde_json::json!({
+                        "type": "text",
+                        "text": "[image omitted: smaller than 8×8]"
+                    });
+                    n += 1;
+                }
+                i += 1;
+            }
+            n
+        }
+        _ => 0,
+    }
+}
+
+fn is_tiny_image(block: &Value) -> bool {
+    if block.get("type").and_then(Value::as_str) != Some("image") {
+        return false;
+    }
+    let Some(source) = block.get("source") else {
+        return false;
+    };
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return false;
+    }
+    let Some(data) = source.get("data").and_then(Value::as_str) else {
+        return false;
+    };
+    image_edges(data).is_some_and(|(w, h)| w < MIN_IMAGE_EDGE || h < MIN_IMAGE_EDGE)
+}
+
+fn image_edges(b64: &str) -> Option<(u32, u32)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(b64.trim().replace('\n', "")))
+        .ok()?;
+    png_edges(&raw).or_else(|| jpeg_edges(&raw)).or_else(|| gif_edges(&raw))
+}
+
+fn png_edges(raw: &[u8]) -> Option<(u32, u32)> {
+    if raw.len() < 24 || &raw[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    if &raw[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(raw[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(raw[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
+fn jpeg_edges(raw: &[u8]) -> Option<(u32, u32)> {
+    if raw.len() < 4 || raw[0] != 0xFF || raw[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 9 < raw.len() {
+        if raw[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = raw[i + 1];
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if i + 4 > raw.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([raw[i + 2], raw[i + 3]]) as usize;
+        if (0xC0..=0xC2).contains(&marker) && i + 9 < raw.len() {
+            let h = u16::from_be_bytes([raw[i + 5], raw[i + 6]]) as u32;
+            let w = u16::from_be_bytes([raw[i + 7], raw[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+fn gif_edges(raw: &[u8]) -> Option<(u32, u32)> {
+    if raw.len() < 10 || (&raw[0..6] != b"GIF87a" && &raw[0..6] != b"GIF89a") {
+        return None;
+    }
+    let w = u16::from_le_bytes([raw[6], raw[7]]) as u32;
+    let h = u16::from_le_bytes([raw[8], raw[9]]) as u32;
+    Some((w, h))
 }
 
 pub fn split_base_url(url: &str) -> Result<(String, String)> {
@@ -1399,5 +1515,37 @@ mod tests {
             Some("grok-composer-2.5-fast")
         );
         assert!(!map.values().any(|v| v == "claude-opus-5"));
+    }
+
+    const PNG_2X2: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn png_2x2_is_tiny() {
+        assert_eq!(image_edges(PNG_2X2), Some((2, 2)));
+        assert!(image_edges(PNG_2X2).is_some_and(|(w, h)| w < 8 || h < 8));
+    }
+
+    #[test]
+    fn strip_tiny_images_replaces_2x2_keeps_text() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": PNG_2X2
+                    }}
+                ]
+            }]
+        });
+        assert_eq!(strip_tiny_images(&mut body), 1);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "see");
+        assert_eq!(content[1]["type"], "text");
+        assert!(content[1]["text"].as_str().unwrap().contains("8"));
     }
 }
