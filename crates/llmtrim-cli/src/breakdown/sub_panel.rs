@@ -239,7 +239,7 @@ impl SubPanel {
                     self.search.clear();
                     self.refilter();
                     self.status =
-                        "← from  → to  ·  type to search  ·  +/- rows  ·  w save  ·  Esc"
+                        "← from  → to  ·  type to search  ·  s save  ·  a add  ·  d del  ·  Esc"
                             .into();
                 }
                 KeyCode::Char('r') => {
@@ -278,8 +278,17 @@ impl SubPanel {
                 KeyCode::Down => self.move_pick(1),
                 KeyCode::Tab => self.move_row(1),
                 KeyCode::BackTab => self.move_row(-1),
-                KeyCode::Char('+') | KeyCode::Insert => self.add_row(),
-                KeyCode::Char('-') | KeyCode::Delete => self.remove_row(),
+                KeyCode::Char('a') | KeyCode::Char('+') | KeyCode::Insert
+                    if self.search.is_empty() =>
+                {
+                    self.add_row();
+                }
+                KeyCode::Char('d') | KeyCode::Char('-') | KeyCode::Delete
+                    if self.search.is_empty() =>
+                {
+                    self.remove_row();
+                }
+                KeyCode::Char('s') if self.search.is_empty() => self.save_map(),
                 KeyCode::Char('w') if self.search.is_empty() => self.save_map(),
                 KeyCode::Backspace => {
                     self.search.pop();
@@ -472,9 +481,11 @@ impl SubPanel {
         match self.focus {
             Focus::Presets => " Tab tabs · ←→ mode · [ ] chain · Enter apply · e map · r refresh · q",
             Focus::Map if self.map_dirty => {
-                " ← from · → to · ↑↓ pick · Enter pick · w / Ctrl+s SAVE · Esc discard"
+                " ← from · → to · ↑↓ pick · Enter pick · s SAVE · a add · d del · Esc discard"
             }
-            Focus::Map => " ← from · → to · ↑↓ pick · Enter pick · w / Ctrl+s save · Esc",
+            Focus::Map => {
+                " ← from · → to · ↑↓ pick · Enter pick · s save · a add · d del · Esc"
+            }
         }
     }
 
