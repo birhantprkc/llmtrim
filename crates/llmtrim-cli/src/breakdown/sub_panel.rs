@@ -31,7 +31,7 @@ impl RoutingPreset {
     fn label(self) -> &'static str {
         match self {
             RoutingPreset::Off => "Off",
-            RoutingPreset::Always => "Always → CLIProxyAPI",
+            RoutingPreset::Always => "Always",
             RoutingPreset::Fallback => "Fallback",
         }
     }
@@ -47,6 +47,31 @@ enum Focus {
 enum Col {
     From,
     To,
+}
+
+fn hop_display(hop: &str) -> &str {
+    match hop {
+        "anthropic" | "direct" => "Anthropic",
+        "on" | "cliproxy" | "cli-proxy" | "cli-proxy-api" | "cliproxyapi" => "mapped models",
+        "codex" | "chatgpt" | "openai" => "Codex",
+        "claude" => "Claude",
+        "gemini" | "antigravity" | "aistudio" => "Gemini",
+        "grok" | "xai" | "x-ai" => "Grok",
+        "kimi" | "moonshot" => "Kimi",
+        "vertex" => "Vertex",
+        "qwen" => "Qwen",
+        "copilot" | "github" => "Copilot",
+        other => other,
+    }
+}
+
+fn format_try_chain(hops: &[String]) -> String {
+    let names: Vec<&str> = hops.iter().map(|h| hop_display(h)).collect();
+    match names.as_slice() {
+        [] => "Try the next hop on failure".into(),
+        [one] => format!("Try {one}"),
+        [first, rest @ ..] => format!("Try {first}, then {}", rest.join(", then ")),
+    }
 }
 
 fn side_label(col: Col) -> &'static str {
@@ -410,7 +435,7 @@ impl SubPanel {
         }
         let k = dir.rem_euclid(n) as usize;
         self.chain.rotate_left(k);
-        self.status = format!("chain {}", self.chain.join(" → "));
+        self.status = format_try_chain(&self.chain);
     }
 
     fn apply_selected(&mut self) {
@@ -436,7 +461,7 @@ impl SubPanel {
                 cliproxy::ensure_for_existing_user()?;
                 llmtrim_core::config::enable_sub("on")?;
                 llmtrim_core::config::write_sub_mode(false)?;
-                Ok("always → CLIProxyAPI (tier map still applies)".into())
+                Ok("always on — every turn uses the mapped models".into())
             }
             RoutingPreset::Fallback => {
                 cliproxy::ensure_for_existing_user()?;
@@ -448,7 +473,7 @@ impl SubPanel {
                     self.chain.clone()
                 };
                 llmtrim_core::config::write_sub_chain(&chain)?;
-                Ok(format!("fallback · {}", chain.join(" → ")))
+                Ok(format_try_chain(&chain))
             }
         }
     }
@@ -538,14 +563,12 @@ impl SubPanel {
                 self.catalog.len()
             )),
             Line::from(if self.selected == RoutingPreset::Fallback {
-                format!(
-                    "chain {}",
-                    if self.chain.is_empty() {
-                        "anthropic → on".into()
-                    } else {
-                        self.chain.join(" → ")
-                    }
-                )
+                let hops = if self.chain.is_empty() {
+                    vec!["anthropic".into(), "on".into()]
+                } else {
+                    self.chain.clone()
+                };
+                format_try_chain(&hops)
             } else {
                 String::new()
             }),
@@ -769,5 +792,17 @@ mod tests {
         let p = SubPanel::new();
         assert!(!p.needs_apply);
         assert!(!p.capturing_keys());
+    }
+
+    #[test]
+    fn try_chain_sentence_hides_internal_on() {
+        assert_eq!(
+            format_try_chain(&["anthropic".into(), "on".into()]),
+            "Try Anthropic, then mapped models"
+        );
+        assert_eq!(
+            format_try_chain(&["codex".into(), "anthropic".into()]),
+            "Try Codex, then Anthropic"
+        );
     }
 }
