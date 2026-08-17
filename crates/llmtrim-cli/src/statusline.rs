@@ -898,8 +898,7 @@ pub fn run() -> Result<()> {
 // ── install / uninstall (wire ~/.claude/settings.json) ────────────────────────────
 
 /// Whether Claude Code appears to be installed (its `~/.claude` config dir exists). Used by
-/// `setup` to hint at the status line for Claude Code users only, not users of other agents —
-/// setup itself is client-agnostic and never writes this file.
+/// `ensure` to decide whether to wire `/sub` (and to refresh a previously owned status line).
 pub fn claude_code_present() -> bool {
     claude_settings_path()
         .ok()
@@ -1095,7 +1094,7 @@ pub enum OwnedStatus {
     Foreign,
 }
 
-/// Whether ensure should install / refresh the status line.
+/// Whether this binary owns the current `statusLine` (Missing is not first-installed by ensure).
 pub fn owned_status() -> OwnedStatus {
     let Ok(path) = claude_settings_path() else {
         return OwnedStatus::Missing;

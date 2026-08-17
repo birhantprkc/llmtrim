@@ -544,7 +544,8 @@ pub enum OwnedStatus {
     Current,
 }
 
-/// Whether ensure should wire / refresh the cold-cache guard.
+/// Ownership of the guard hook relative to this binary. `ensure` refreshes Stale only;
+/// it does not first-install Missing (deprecated).
 pub fn owned_status() -> OwnedStatus {
     let Ok(path) = claude_settings_path() else {
         return OwnedStatus::Missing;

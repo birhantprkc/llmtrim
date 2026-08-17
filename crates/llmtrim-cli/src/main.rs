@@ -132,11 +132,11 @@ enum Commands {
         #[command(subcommand)]
         action: AgentsCmd,
     },
-    /// Configure cheaper models for Claude Code `/compact`
+    /// Configure cheaper models for Claude Code `/compact` (deprecated; opt-in)
     ///
-    /// Configured alternatives are tried in order when they fit the request. The model Claude Code
-    /// originally requested is always the implicit final fallback. Prefer `llmtrim ensure` /
-    /// `setup` for the recommended defaults — this is the power-user escape hatch.
+    /// Not installed by `setup` / `ensure`. Configured alternatives are tried in order when they
+    /// fit the request. The model Claude Code originally requested is always the implicit final
+    /// fallback.
     #[command(hide = true)]
     Compact {
         #[command(subcommand)]
@@ -167,8 +167,8 @@ enum Commands {
     ///
     /// The fastest path from install to compressing: ensures the local CA, sets
     /// HTTPS_PROXY + CA trust in your environment (shell profile on POSIX,
-    /// HKCU\Environment on Windows), enables run-at-login, wires Claude Code
-    /// integrations (statusline, guard, /sub, compact), and starts the interceptor.
+    /// HKCU\Environment on Windows), enables run-at-login, wires Claude Code `/sub`,
+    /// and starts the interceptor.
     /// Idempotent — re-running reuses the same port and won't restart a healthy daemon.
     /// No sudo.
     Setup {
@@ -187,9 +187,10 @@ enum Commands {
     },
     /// Bring this machine to the recommended current state
     ///
-    /// Idempotent: rewrites owned Claude Code hooks/statusline when stale, installs
-    /// recommended integrations you have not opted out of, and restarts a version-skewed
-    /// daemon. Same engine `setup` and `update` use — the one verb after a release.
+    /// Idempotent: rewrites owned Claude Code `/sub` (and a previously installed statusline
+    /// or guard) when stale, installs `/sub` / subagents you have not opted out of, and
+    /// restarts a version-skewed daemon. Same engine `setup` and `update` use — the one verb
+    /// after a release. Does not install statusline, guard, or cheaper `/compact`.
     Ensure {
         /// Suppress the summary panel (for scripts / postinstall hooks).
         #[arg(long, short = 'q')]
@@ -307,20 +308,20 @@ enum Commands {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
-    /// Render Claude Code's custom status line (hook entrypoint; prefer `llmtrim ensure`)
+    /// Render Claude Code's custom status line (deprecated; opt-in)
     ///
     /// With no subcommand, reads Claude Code's JSON session blob on stdin and prints one
-    /// elegant line. `install` / `uninstall` are power-user escape hatches — `setup`,
-    /// `update`, and `ensure` keep the status line current automatically.
+    /// elegant line. Not installed by `setup` / `ensure`. `install` wires it; `ensure` only
+    /// refreshes an already-owned line.
     #[command(hide = true)]
     Statusline {
         #[command(subcommand)]
         action: Option<StatuslineCmd>,
     },
-    /// Cold-cache resume warning hook (prefer `llmtrim ensure`)
+    /// Cold-cache resume warning hook (deprecated; opt-in)
     ///
-    /// With no subcommand, acts as Claude Code's `UserPromptSubmit` hook. `install` /
-    /// `uninstall` are escape hatches — `setup` / `update` / `ensure` wire this for you.
+    /// With no subcommand, acts as Claude Code's `UserPromptSubmit` hook. Not installed by
+    /// `setup` / `ensure`. `install` wires it; `ensure` only refreshes an already-owned hook.
     #[command(hide = true)]
     Guard {
         #[command(subcommand)]

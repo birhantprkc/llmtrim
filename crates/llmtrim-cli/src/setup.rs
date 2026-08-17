@@ -540,9 +540,10 @@ pub fn run(requested: Option<u16>, force: bool) -> Result<()> {
         Err(e) => rows.push((ui::WARN, "Autostart".into(), format!("not enabled: {e}"))),
     }
 
-    // 3b. Claude Code integrations + tray: one ensure pass (statusline, guard, /sub, compact,
-    //     tray autostart). Idempotent; honors remembered opt-outs. `--force` / non-TTY take
-    //     recommended defaults without asking.
+    // 3b. Claude Code integrations + tray: one ensure pass (`/sub`, subagents, tray autostart).
+    //     Statusline, guard, and cheaper `/compact` are not first-installed (deprecated).
+    //     Idempotent; honors remembered opt-outs. `--force` / non-TTY take recommended
+    //     defaults without asking.
     let ensure_report = crate::ensure::apply(crate::ensure::Options {
         interactive: !force && std::io::IsTerminal::is_terminal(&std::io::stdin()),
         quiet: true,
@@ -662,8 +663,7 @@ pub fn run(requested: Option<u16>, force: bool) -> Result<()> {
         "  {}  llmtrim status",
         ui::paint(color, Tone::Dim, "watch savings")
     );
-    // Claude Code integrations (statusline, guard, /sub, compact) are applied by ensure above —
-    // no separate install homework.
+    // Claude Code `/sub` is applied by ensure above — no separate install homework.
     #[cfg(windows)]
     println!(
         "{}",

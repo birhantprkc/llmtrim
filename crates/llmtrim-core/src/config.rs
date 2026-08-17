@@ -1496,7 +1496,7 @@ pub fn write_compact_models(models: &[String]) -> Result<()> {
 }
 
 /// Whether the config explicitly contains `[compact].models`, including an empty list used to
-/// remember that setup's recommendation was declined.
+/// remember a prior opt-out. `setup` / `ensure` no longer write this key.
 pub fn compact_models_configured() -> bool {
     let Some(path) = config_path() else {
         return false;

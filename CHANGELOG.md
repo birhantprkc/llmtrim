@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **Statusline, cold-cache guard, and cheaper `/compact` are off by default.** `setup` /
+  `ensure` no longer first-install them. New machines get `/sub` (and routed subagents)
+  only. An already-owned status line or guard is still refreshed on upgrade; compact
+  model lists already in `config.toml` still apply. Opt in with `llmtrim statusline
+  install`, `llmtrim guard install`, or `llmtrim compact models haiku sonnet`.
+
 - **Status watch SVGs show the 0.13 Sub tab.** The README hero
   (`status-watch-dark.svg` / `status-watch-light.svg`) still rendered the
   0.12 Always→Codex / kimi / grok presets. Tab 4 now matches CLIProxyAPI:

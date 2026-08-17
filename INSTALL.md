@@ -100,20 +100,16 @@ curl and the npm one-liner above run this for you. After Cargo, Homebrew, Scoop,
 `LLMTRIM_NO_SETUP=1`, run it yourself:
 
 ```bash
-llmtrim setup      # CA + shell env + autostart + Claude Code integrations + daemon
+llmtrim setup      # CA + shell env + autostart + Claude Code /sub + daemon
 llmtrim status     # live savings dashboard
 ```
 
 Open a new terminal so tools inherit `HTTPS_PROXY`. Re-running `setup` is safe (idempotent).
 
-When Claude Code is present (`~/.claude`), `setup` also enables:
-
-- status line
-- cold-cache guard
-- window-local `/sub`
-- cheaper `/compact` model chain
-
-No separate install steps for those. Later upgrades refresh them via `update` / `ensure`.
+When Claude Code is present (`~/.claude`), `setup` also enables window-local `/sub`.
+Status line, cold-cache guard, and cheaper `/compact` are not installed (deprecated;
+opt in with `llmtrim statusline install`, `llmtrim guard install`, `llmtrim compact models …`).
+Existing installs of those keep working; `ensure` refreshes an already-owned status line or guard.
 
 llmtrim is a local MITM proxy (plus optional Claude Code hooks).
 `llmtrim uninstall` reverses it. How traffic reaches tools: [README](README.md#what-it-does).
