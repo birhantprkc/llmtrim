@@ -168,16 +168,43 @@ impl SubPanel {
     }
 
     pub fn seed_export_demo(&mut self) {
-        self.selected = RoutingPreset::AlwaysCodex;
-        self.applied = RoutingPreset::AlwaysCodex;
+        self.selected = RoutingPreset::Fallback;
+        self.applied = RoutingPreset::Fallback;
         self.running = true;
+        self.chain = vec![
+            "anthropic".into(),
+            "codex".into(),
+            "gemini".into(),
+            "grok".into(),
+        ];
         self.rows = vec![
             ("fable".into(), "grok-4.6".into()),
             ("opus".into(), "grok-4.6".into()),
             ("sonnet".into(), "grok-4.6".into()),
             ("haiku".into(), "grok-composer-2.5-fast".into()),
         ];
-        self.status = "demo".into();
+        if self.catalog.is_empty() {
+            self.catalog = [
+                ("gpt-5.4", "openai", "codex"),
+                ("claude-opus-4-6", "anthropic", "claude"),
+                ("gemini-3-pro", "google", "gemini"),
+                ("grok-4.6", "xai", "grok"),
+                ("grok-composer-2.5-fast", "xai", "grok"),
+                ("kimi-k2.5", "moonshot", "kimi"),
+                ("gemini-claude-opus-4-6", "google", "vertex"),
+                ("qwen3-max", "alibaba", "qwen"),
+                ("gpt-4.1", "github", "copilot"),
+            ]
+            .into_iter()
+            .map(|(id, owned, family)| OfficialModel {
+                id: id.to_string(),
+                owned_by: owned.into(),
+                display_name: id.to_string(),
+                family: family.into(),
+            })
+            .collect();
+        }
+        self.status.clear();
     }
 
     fn read_applied_preset() -> RoutingPreset {
