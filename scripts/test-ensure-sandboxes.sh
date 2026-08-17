@@ -102,7 +102,7 @@ with_sandbox s1 with-claude -- bash -c '
   exit 0
 ' && ok "s1 ensure + opt-out" || bad "s1 ensure + opt-out"
 
-# ── Step 2a: setup wires integrations ────────────────────────────────────────
+# ── Step 2a: setup wires /sub, not deprecated extras ────────────────────────
 with_sandbox s2a with-claude -- bash -c '
   set -e
   '"$BIN"' setup --force </dev/null >/tmp/llmtrim-setup-out.$$ 2>&1 || {
@@ -111,27 +111,26 @@ with_sandbox s2a with-claude -- bash -c '
   }
   rm -f /tmp/llmtrim-setup-out.$$
   test -f "$LLMTRIM_HOME/integrations.json"
-  jq -e ".statusLine.command | test(\"statusline\")" "$HOME/.claude/settings.json" >/dev/null
-  jq -e ".statusLine.refreshInterval == 300" "$HOME/.claude/settings.json" >/dev/null
-  jq -e ".. | strings | select(test(\"guard\"))" "$HOME/.claude/settings.json" >/dev/null
+  jq -e "has(\"statusLine\") | not" "$HOME/.claude/settings.json" >/dev/null
+  if jq -e ".. | strings | select(test(\" guard$\"))" "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    exit 1
+  fi
   test -f "$HOME/.claude/skills/sub/SKILL.md"
   grep -q "llmtrim-owned-window-sub" "$HOME/.claude/skills/sub/SKILL.md"
-  # compact configured somewhere under XDG
   found=0
   while IFS= read -r -d "" f; do
     if grep -q "\[compact\]" "$f" 2>/dev/null; then found=1; break; fi
   done < <(find "$XDG_CONFIG_HOME" -name "config.toml" -print0 2>/dev/null || true)
-  # also check HOME/.config
   while IFS= read -r -d "" f; do
     if grep -q "\[compact\]" "$f" 2>/dev/null; then found=1; break; fi
   done < <(find "$HOME" -name "config.toml" -print0 2>/dev/null || true)
-  test "$found" = 1
-' && ok "s2a setup wires integrations" || bad "s2a setup wires integrations"
+  test "$found" = 0
+' && ok "s2a setup wires /sub only" || bad "s2a setup wires /sub only"
 
-# ── Step 2b: stale statusline rewrite ────────────────────────────────────────
+# ── Step 2b: stale statusline rewrite (already owned) ────────────────────────
 with_sandbox s2b with-claude -- bash -c '
   set -e
-  '"$BIN"' ensure -q </dev/null
+  '"$BIN"' statusline install >/dev/null
   jq ".statusLine = {
         \"type\": \"command\",
         \"command\": \"/old/cellar/llmtrim statusline\",
@@ -144,14 +143,13 @@ with_sandbox s2b with-claude -- bash -c '
   jq -e ".statusLine.refreshInterval == 300" "$HOME/.claude/settings.json" >/dev/null
 ' && ok "s2b stale statusline rewrite" || bad "s2b stale statusline rewrite"
 
-# ── Step 3: ensure installs statusline; foreign left alone ───────────────────
+# ── Step 3: ensure does not first-install statusline; foreign left alone ─────
 with_sandbox s3a with-claude -- bash -c '
   set -e
   echo "{}" >"$HOME/.claude/settings.json"
   '"$BIN"' ensure -q </dev/null
-  jq -e ".statusLine.type == \"command\"" "$HOME/.claude/settings.json" >/dev/null
-  jq -e ".statusLine.command | test(\"statusline\")" "$HOME/.claude/settings.json" >/dev/null
-' && ok "s3a statusline install" || bad "s3a statusline install"
+  jq -e "has(\"statusLine\") | not" "$HOME/.claude/settings.json" >/dev/null
+' && ok "s3a statusline not first-installed" || bad "s3a statusline not first-installed"
 
 with_sandbox s3b with-claude -- bash -c '
   set -e
@@ -172,7 +170,7 @@ with_sandbox s4 with-claude -- bash -c '
   set -e
   test "$d1" -ne 0
   '"$BIN"' doctor --fix </dev/null >/dev/null 2>&1 || true
-  jq -e ".statusLine.command | test(\"statusline\")" "$HOME/.claude/settings.json" >/dev/null
+  jq -e "has(\"statusLine\") | not" "$HOME/.claude/settings.json" >/dev/null
   test -f "$HOME/.claude/skills/sub/SKILL.md"
 ' && ok "s4 doctor --fix" || bad "s4 doctor --fix"
 
@@ -226,8 +224,10 @@ with_sandbox s8a no-claude -- bash -c '
 with_sandbox s8b with-claude -- bash -c '
   set -e
   '"$BIN"' ensure </dev/null >/dev/null
-  jq -e ".statusLine.refreshInterval == 300" "$HOME/.claude/settings.json" >/dev/null
-  jq -e ".. | strings | select(test(\"guard\"))" "$HOME/.claude/settings.json" >/dev/null
+  jq -e "has(\"statusLine\") | not" "$HOME/.claude/settings.json" >/dev/null
+  if jq -e ".. | strings | select(test(\" guard$\"))" "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    exit 1
+  fi
   test -f "$HOME/.claude/skills/sub/SKILL.md"
   test -f "$LLMTRIM_HOME/integrations.json"
   # update reminder path (package channel) should not crash

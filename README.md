@@ -17,9 +17,8 @@
 
 <p align="center">
   <sub>
-    Using <b>Claude Code</b>? One install also gets you a live <a href="#claude-code">status line</a>,
-    a <a href="#claude-code">cold-cache guard</a>, cheaper <a href="#claude-code"><code>/compact</code></a>,
-    and <a href="#claude-code"><code>/sub</code></a> to serve it through CLIProxyAPI.
+    Using <b>Claude Code</b>? One install also gets you <a href="#claude-code"><code>/sub</code></a>
+    to serve it through CLIProxyAPI.
   </sub>
 </p>
 
@@ -76,7 +75,7 @@ llmtrim sits on your machine as a local proxy, trims the waste, and forwards a s
 
 Compression cannot raise your bill or break a request; worst case is zero savings. Everything runs locally, nothing is sent to us. [In action →](#in-action)
 
-For Claude Code the same install goes further: a status line with live trim % and rate limits, a guard that warns before an expired prompt cache re-bills your whole context, `/compact` on a cheaper model, and `/sub` to route sessions through another subscription. [Details →](#claude-code)
+For Claude Code the same install also wires `/sub` to route sessions through another subscription. [Details →](#claude-code)
 
 ---
 
@@ -88,7 +87,7 @@ npm install -g @llmtrim/cli@latest && llmtrim setup
 llmtrim status
 ```
 
-That's it. `setup` starts a local proxy, wires your shell, and enables recoverable tool-output shaping. When Claude Code is present, it also turns on the status line, cold-cache guard, `/sub`, and cheaper `/compact`. You do not run a separate install for each of those.
+That's it. `setup` starts a local proxy, wires your shell, and enables recoverable tool-output shaping. When Claude Code is present, it also turns on `/sub`. You do not run a separate install for that.
 
 | You want | Run |
 |---|---|
@@ -165,7 +164,7 @@ llmtrim ensure     # match the recommended install state on this machine
 | Force one session through llmtrim | `llmtrim wrap claude` |
 | Remove everything | `llmtrim uninstall` |
 
-After `setup`, `update`, or `ensure`, owned Claude Code pieces (status line, guard, `/sub`, compact defaults) stay in sync with the binary. You should not need `statusline install` or similar after an upgrade.
+After `setup`, `update`, or `ensure`, owned Claude Code `/sub` stays in sync with the binary.
 
 Time series: `llmtrim status --daily` · `--weekly` · `--monthly` · `--json` · `--csv`.
 
@@ -242,68 +241,11 @@ Default `auto` enables each stage only where it pays. `safe` is lossless-only. [
 
 ## Claude Code
 
-When `~/.claude` exists, `setup`, `update`, and `ensure` wire these. No separate install commands.
+When `~/.claude` exists, `setup`, `update`, and `ensure` wire `/sub` (and routed subagents). No separate install command for that.
 
 | Feature | What you get |
 |---|---|
-| Status line | Model, context gauge, trim %, rate limits, cache warm/cold |
-| Guard | Blocks one turn if a cold-cache resume would rewrite a huge context (and bill for it) |
-| `/compact` models | Prefer Haiku → Sonnet before your selected model, but only when the prompt cache is cold |
 | `/sub` | Per-window: `/sub on [optional:codex\|kimi\|grok]` · `/sub off` · `/sub status` |
-
-```text
-◆ Opus→gpt-5.6-terra   ▓▓▓▓▓░░░ 142k   ✂ 6.8%   ◔ 3h·24% · 4d·12%   ♻ 63% cached
-```
-
-<details>
-<summary><b>Status line details</b></summary>
-
-Claude Code [custom status line](https://code.claude.com/docs/en/statusline). The arrow is the backend that answered the last turn (not merely what is configured). In `sub` fallback mode it stays off while Anthropic serves and shows up when a chain provider does.
-
-- `✂`: trim for this session (`✂ –` until something is saved)
-- `◔`: rate-limit windows (time left · % used) — Claude.ai when Anthropic is serving; under `/sub` the active plan's windows (Codex today: weekly always, 5h when the plan reports one). Kimi/Grok fill in when their usage APIs are wired
-- Context gauge: fill of the serving model's real window (green under 40%, orange 40-65%, red above)
-- `♻`: prompt-cache reuse; becomes `♻ cache cold` after the cache TTL
-
-Owned settings rewrite themselves when the binary path or payload changes. To opt out, leave your own status line in place, or uninstall ours (`llmtrim statusline uninstall`).
-
-</details>
-
-<details>
-<summary><b>Cold-cache guard</b></summary>
-
-Resuming a large session after the prompt-cache TTL rewrites the whole context at cache-write rates (often a few dollars) with no warning at the prompt.
-
-Guard is a free `UserPromptSubmit` hook. It blocks one turn, prints idle time, context size, estimated cost, and the draft you typed (Claude Code clears the input box and would otherwise drop it), then lets a resend through. If you type something else next, the blocked text is also reinjected as model context. `/compact` pays that cold write too, because it has to read the full context to summarize. Local-only slash commands that never hit the model (today: `/sub`) pass through without acking the gap, so the next real prompt still warns.
-
-Opt out: `llmtrim guard uninstall`. `ensure` remembers that choice.
-
-```text
-Idle 6h 19m, 347k tokens of context. The prompt cache has expired, so the next turn
-rewrites the whole context (about $3.47 before any work happens).
-```
-
-</details>
-
-<details>
-<summary><b>Cheaper `/compact`</b></summary>
-
-```bash
-llmtrim compact models haiku sonnet   # setup already sets this by default
-llmtrim compact status
-llmtrim compact off
-```
-
-```toml
-[compact]
-models = ["haiku", "sonnet"]
-```
-
-Candidates run in order when they fit the compressed request. Claude's selected model is always the last fallback (do not put it in the list). Empty `models = []` records opt-out.
-
-The redirect only fires once the prompt cache has gone cold. `/compact` re-sends the conversation Claude Code has been caching against your selected model, so while that cache is warm a cache-read there costs less than a cold read on a smaller model, and the compact stays home. After the cache expires the cheaper model wins, so that is when the redirect takes over.
-
-</details>
 
 <details>
 <summary><b>Subscription reroute (`sub`)</b> (opt-in; may conflict with provider ToS)</summary>
@@ -540,8 +482,7 @@ These knobs are orthogonal to compression. Each resolves env-first, then from th
 
 </details>
 
-Claude Code options (compact models, subscription reroute) are under
-[Claude Code](#claude-code).
+Claude Code options (subscription reroute) are under [Claude Code](#claude-code).
 
 <details>
 <summary><b>Upstream proxy</b> (corporate egress or chaining local tools)</summary>

@@ -1,5 +1,6 @@
 //! Claude Code compaction request detection and ordered model planning.
 //!
+//! Opt-in via `[compact].models` / `llmtrim compact models` — `setup` does not write defaults.
 //! Claude Code handles `/compact` locally and sends a normal Anthropic Messages request. The
 //! internal summarization prompt is the protocol marker; ordinary user text mentioning `/compact`
 //! must never trigger model substitution.

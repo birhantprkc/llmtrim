@@ -2,8 +2,10 @@
 //!
 //! Happy path: `llmtrim setup` / `llmtrim update` / `llmtrim doctor --fix` / status `f` all
 //! land here. Power-user install/uninstall commands remain as escape hatches; humans should not
-//! need them after a release. Owned Claude Code hooks and the status line are rewritten in place
-//! when the binary path or feature payload changes so changelogs never say "re-run install".
+//! need them after a release. Owned `/sub` hooks (and a previously installed status line or
+//! guard) are rewritten in place when the binary path or feature payload changes so changelogs
+//! never say "re-run install". Statusline, guard, and cheaper `/compact` are deprecated: new
+//! installs do not wire them.
 
 use std::path::{Path, PathBuf};
 
@@ -124,7 +126,7 @@ fn save_at(path: &Path, state: &State) -> Result<()> {
 /// How ensure was invoked — controls prompting and how loud the report is.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// May prompt on a TTY (first-run compact/tray choices). Non-interactive defaults to yes
+    /// May prompt on a TTY (first-run tray choice). Non-interactive defaults to yes
     /// for recommended items, no for optional network downloads.
     pub interactive: bool,
     /// Skip the success panel (daemon start / quiet migrations).
@@ -134,7 +136,8 @@ pub struct Options {
     /// Allow downloading the Linux tray binary when missing (interactive confirm, or forced).
     pub download_tray: bool,
     /// When false (quiet auto-heal), only refresh *owned* stale integrations and daemon skew —
-    /// never first-install statusline/guard//sub/compact or enable tray autostart.
+    /// never first-install `/sub` / subagents or enable tray autostart. Statusline, guard, and
+    /// compact are never first-installed even when this is true (deprecated).
     pub install_missing: bool,
 }
 
@@ -185,36 +188,33 @@ fn probe_with(state: &State) -> Vec<Gap> {
     let mut gaps = Vec::new();
     let claude = crate::statusline::claude_code_present();
 
-    if claude && !state.opt_out.statusline {
-        match crate::statusline::owned_status() {
-            crate::statusline::OwnedStatus::Missing => gaps.push(Gap {
-                id: "statusline",
-                label: "Statusline".into(),
-                detail: "not installed — recommended for Claude Code".into(),
-            }),
-            crate::statusline::OwnedStatus::Stale => gaps.push(Gap {
-                id: "statusline",
-                label: "Statusline".into(),
-                detail: "stale (binary path or refresh settings)".into(),
-            }),
-            crate::statusline::OwnedStatus::Current | crate::statusline::OwnedStatus::Foreign => {}
-        }
+    if claude
+        && !state.opt_out.statusline
+        && matches!(
+            crate::statusline::owned_status(),
+            crate::statusline::OwnedStatus::Stale
+        )
+    {
+        // Deprecated: missing is not a gap. Refresh only an already-owned stale line.
+        gaps.push(Gap {
+            id: "statusline",
+            label: "Statusline".into(),
+            detail: "stale (binary path or refresh settings)".into(),
+        });
     }
 
-    if claude && !state.opt_out.guard {
-        match crate::guard::owned_status() {
-            crate::guard::OwnedStatus::Missing => gaps.push(Gap {
-                id: "guard",
-                label: "Guard".into(),
-                detail: "not installed — warns before cold-cache resumes".into(),
-            }),
-            crate::guard::OwnedStatus::Stale => gaps.push(Gap {
-                id: "guard",
-                label: "Guard".into(),
-                detail: "stale (binary path)".into(),
-            }),
-            crate::guard::OwnedStatus::Current => {}
-        }
+    if claude
+        && !state.opt_out.guard
+        && matches!(
+            crate::guard::owned_status(),
+            crate::guard::OwnedStatus::Stale
+        )
+    {
+        gaps.push(Gap {
+            id: "guard",
+            label: "Guard".into(),
+            detail: "stale (binary path)".into(),
+        });
     }
 
     if claude && !state.opt_out.window_sub {
@@ -248,14 +248,6 @@ fn probe_with(state: &State) -> Vec<Gap> {
             }),
             Ok(_) | Err(_) => {}
         }
-    }
-
-    if claude && !state.opt_out.compact && !llmtrim_core::config::compact_models_configured() {
-        gaps.push(Gap {
-            id: "compact",
-            label: "Compact".into(),
-            detail: "cheaper /compact models not configured".into(),
-        });
     }
 
     // Version skew: daemon older than this binary.
@@ -316,8 +308,8 @@ pub fn apply(opts: Options) -> Result<Report> {
 
     if claude && !state.opt_out.statusline {
         let status = crate::statusline::owned_status();
-        let skip_missing =
-            !opts.install_missing && matches!(status, crate::statusline::OwnedStatus::Missing);
+        // Deprecated: never first-install. Refresh an already-owned (or foreign-skip) line.
+        let skip_missing = matches!(status, crate::statusline::OwnedStatus::Missing);
         if !skip_missing {
             match crate::statusline::sync_owned() {
                 Ok(crate::statusline::SyncOutcome::Installed) => {
@@ -363,8 +355,7 @@ pub fn apply(opts: Options) -> Result<Report> {
 
     if claude && !state.opt_out.guard {
         let gstatus = crate::guard::owned_status();
-        let skip_missing =
-            !opts.install_missing && matches!(gstatus, crate::guard::OwnedStatus::Missing);
+        let skip_missing = matches!(gstatus, crate::guard::OwnedStatus::Missing);
         if !skip_missing {
             match crate::guard::sync_owned() {
                 Ok(true) => {
@@ -469,43 +460,8 @@ pub fn apply(opts: Options) -> Result<Report> {
             .push((ui::NOTE, "Subagents".into(), "opted out".into()));
     }
 
-    if claude
-        && opts.install_missing
-        && !state.opt_out.compact
-        && !llmtrim_core::config::compact_models_configured()
-    {
-        let want = if opts.interactive {
-            confirm_default_yes("Use cheaper models for Claude Code /compact (Haiku → Sonnet)?")
-        } else {
-            true
-        };
-        if want {
-            match llmtrim_core::config::write_compact_models(&["haiku".into(), "sonnet".into()]) {
-                Ok(()) => {
-                    report.applied.push("compact");
-                    report.rows.push((
-                        ui::OK,
-                        "Compact".into(),
-                        "Haiku → Sonnet → original model".into(),
-                    ));
-                }
-                Err(e) => {
-                    report
-                        .rows
-                        .push((ui::WARN, "Compact".into(), format!("not configured: {e:#}")))
-                }
-            }
-        } else {
-            // Remember opt-out as empty models list + flag.
-            let _ = llmtrim_core::config::write_compact_models(&[]);
-            state.opt_out.compact = true;
-            report.rows.push((
-                ui::OK,
-                "Compact".into(),
-                "original model only (remembered)".into(),
-            ));
-        }
-    } else if claude && llmtrim_core::config::compact_models_configured() {
+    // Deprecated: never write `[compact].models` on setup/ensure. Leave an existing list alone.
+    if claude && llmtrim_core::config::compact_models_configured() {
         report
             .rows
             .push((ui::OK, "Compact".into(), "configured".into()));
@@ -700,7 +656,8 @@ pub fn maybe_auto() -> Result<bool> {
         .iter()
         .any(|g| g.id == "daemon" || g.detail.contains("stale"));
     // Quiet path never first-installs missing integrations — only refresh owned stale
-    // pieces / daemon skew, or stamp the version after a binary bump.
+    // pieces / daemon skew, or stamp the version after a binary bump. Statusline/guard/compact
+    // are never first-installed on any path.
     if !version_mismatch && !needs_refresh {
         return Ok(false);
     }
@@ -1004,6 +961,15 @@ mod tests {
         assert!(!s.opt_out.statusline);
         assert!(!s.opt_out.guard);
         assert!(!s.opt_out.window_sub);
+    }
+
+    #[test]
+    fn probe_never_flags_unconfigured_compact() {
+        let gaps = probe_with(&State::default());
+        assert!(
+            gaps.iter().all(|g| g.id != "compact"),
+            "compact is deprecated and must not be a recommended gap: {gaps:?}"
+        );
     }
 
     #[cfg(feature = "intercept")]
