@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Status watch SVGs show the 0.13 Sub tab.** The README hero
+  (`status-watch-dark.svg` / `status-watch-light.svg`) still rendered the
+  0.12 Always→Codex / kimi / grok presets. Tab 4 now matches CLIProxyAPI:
+  Off / Always / Fallback, `[` `]` hop rotation, sidecar + official catalog,
+  and the grok-4.6 input→output map.
+
 ## [0.13.2] - 2026-08-16
 
 ### Fixed

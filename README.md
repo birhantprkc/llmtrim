@@ -30,7 +30,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="assets/status-watch-light.svg">
-    <img src="assets/status-watch-dark.svg" alt="llmtrim status: Overview savings dashboard, Sessions, Detail, and Sub routing tab (presets + tier map)" width="760">
+    <img src="assets/status-watch-dark.svg" alt="llmtrim status: Overview savings dashboard, Sessions, Detail, and Sub routing tab (CLIProxyAPI presets, fallback hops, and model map)" width="760">
   </picture>
 </p>
 

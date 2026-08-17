@@ -3454,8 +3454,7 @@ mod tests {
         #[cfg(not(feature = "intercept"))]
         let tabs = [Tab::Overview, Tab::Sessions, Tab::Detail];
 
-        // Stable Sub-tab demo state (not the machine's live routing) so the asset
-        // always shows a readable Always→Codex map with mixed auth.
+        // Stable Sub-tab demo (not live routing): Fallback hops + grok-4.6 CLIProxyAPI map.
         #[cfg(feature = "intercept")]
         app.sub.seed_export_demo();
 
