@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **Dependencies.** MITM proxy crate `hudsucker` 0.25 (SNI hostnames plus key-usage/AKI on
+  generated certificates), `comfy-table` 8 for status/eval tables, `actions/setup-java` v6
+  for Kotlin CI, and cargo patch updates including `rmcp` 3.1.4.
+
 - **Statusline, cold-cache guard, and cheaper `/compact` are off by default.** `setup` /
   `ensure` no longer first-install them. New machines get `/sub` (and routed subagents)
   only. An already-owned status line or guard is still refreshed on upgrade; compact
