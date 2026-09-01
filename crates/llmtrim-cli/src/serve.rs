@@ -1863,7 +1863,11 @@ mod imp {
     impl HttpHandler for Interceptor {
         /// Only MITM (forge a cert for) the LLM provider hosts; everything else is
         /// blind-tunneled, so the CA is never used outside its purpose.
-        async fn should_intercept(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
+        async fn should_intercept_connect(
+            &mut self,
+            _ctx: &HttpContext,
+            req: &Request<Body>,
+        ) -> bool {
             host_of(req)
                 .map(|h| host_covered(&h.to_ascii_lowercase(), &self.domains))
                 .unwrap_or(false)
@@ -3815,21 +3819,22 @@ mod imp {
         /// One bounded retry of the turn against Anthropic before the chain takes over. A 503 or a
         /// short 429 is usually a blip, and a blip should not move a turn (and its spend) to a
         /// different provider. Returns the `Pending` back when no retry was possible or the retry
-        /// failed, so the caller falls through to the chain. The retry sends the *original*
-        /// (uncompressed) request — the compressed body isn't retained past the forward — so the
-        /// row is recorded honestly as a no-savings turn.
+        /// failed, so the caller falls through to the chain. `Pending` is boxed on `Err` because
+        /// clippy 1.98's `result_large_err` rejects it on the stack (~816 bytes). The retry sends
+        /// the *original* (uncompressed) request — the compressed body isn't retained past the
+        /// forward — so the row is recorded honestly as a no-savings turn.
         async fn retry_anthropic_once(
             &self,
             mut pending: Pending,
             retry_after_secs: Option<u64>,
-        ) -> Result<Response<Body>, Pending> {
+        ) -> Result<Response<Body>, Box<Pending>> {
             let Some(original) = pending.original.clone() else {
-                return Err(pending);
+                return Err(Box::new(pending));
             };
             // A reset hint beyond the backoff cap (a usage limit hours away) means "don't wait" —
             // go straight to the chain, which is the whole point of fallback mode.
             let Some(wait_ms) = reroute_backoff_ms(0, retry_after_secs) else {
-                return Err(pending);
+                return Err(Box::new(pending));
             };
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             let proxy = self.upstream_proxy.clone();
@@ -3837,10 +3842,10 @@ mod imp {
                 tokio::task::spawn_blocking(move || fetch_original(&original, proxy.as_deref()))
                     .await;
             let Ok(Some((status, content_type, body))) = fetched else {
-                return Err(pending);
+                return Err(Box::new(pending));
             };
             if !(200..300).contains(&status) || is_sub_fallback_body(&body) {
-                return Err(pending);
+                return Err(Box::new(pending));
             }
             pending.input_after = pending.input_before;
             pending.output_shaped = false;
@@ -4146,7 +4151,7 @@ mod imp {
                     let hint = reroute_retry_after_from_headers(&parts.headers, &bytes);
                     match self.retry_anthropic_once(pending, hint).await {
                         Ok(response) => return response,
-                        Err(returned) => pending = returned,
+                        Err(returned) => pending = *returned,
                     }
                 }
                 return self.fallback_to_chain(pending, fb).await;

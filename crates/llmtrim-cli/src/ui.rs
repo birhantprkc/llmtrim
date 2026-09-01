@@ -259,11 +259,10 @@ pub fn kv_rows(color: bool, rows: &[(&str, String, String)]) -> Vec<String> {
 /// Cells may carry ANSI when `color` is true — the `custom_styling` feature keeps
 /// the width math correct.
 pub fn table(color: bool, headers: &[&str]) -> comfy_table::Table {
-    use comfy_table::{Cell, ContentArrangement, Table, modifiers, presets};
+    use comfy_table::{Cell, ContentArrangement, Table, presets};
     let mut t = Table::new();
     // Outer border + header rule only — column separators would fight the panel chrome.
-    t.load_preset(presets::UTF8_BORDERS_ONLY);
-    t.apply_modifier(modifiers::UTF8_ROUND_CORNERS);
+    t.load_style(presets::UTF8_BORDERS_ONLY.with_rounded_corners());
     t.set_content_arrangement(ContentArrangement::Disabled);
     t.set_header(
         headers
@@ -482,6 +481,17 @@ mod tests {
         assert!(out.starts_with("error: failed to read corpus"));
         assert!(out.contains("caused by: io fail"));
         assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn table_uses_rounded_utf8_borders() {
+        let mut t = table(false, &["a", "b"]);
+        t.add_row(vec!["1", "2"]);
+        let out = t.to_string();
+        assert!(
+            out.contains('╭') && out.contains('╰'),
+            "expected rounded corners: {out}"
+        );
     }
 
     #[test]
